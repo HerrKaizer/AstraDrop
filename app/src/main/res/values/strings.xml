@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SolDrop</string>
+    <string name="share_label">Send to iPhone</string>
+    <string name="hce_desc">SolDrop share link</string>
+    <string name="a11y_label">SolDrop NFC pill</string>
+    <string name="a11y_description">Lets SolDrop show its small \"NFC on / NFC off\" pill above the status bar. It does not read the screen or anything you do.</string>
+</resources>

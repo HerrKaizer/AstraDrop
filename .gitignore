@@ -1,0 +1,15 @@
+.gradle/
+.kotlin/
+.idea/
+*.iml
+build/
+app/build/
+local.properties
+*.apk
+*.jks
+*.keystore
+*.log
+/Gemini_Generated_Image_*
+/Screenshot_*
+/hhjm.jpg
+/Airdrop_logo_2025.png
