@@ -129,6 +129,7 @@ object Compressor {
                     }
                     strip.recycle()
                 }
+                ExifCopy.copy(ctx, item.uri, out)
                 Log.i("TapDrop", "compress: ${item.name} ${w}x$h ${item.size} -> ${out.length()} bytes in ${SystemClock.elapsedRealtime() - t0} ms")
             } finally {
                 dec.recycle()

@@ -26,6 +26,9 @@ data class SharedItem(
 
 data class ReceivedItem(val name: String, val uri: Uri, val mime: String)
 
+/** Text or a link sent to the iPhone; its page shows it with a Copy button. */
+data class SharedText(val id: String, val text: String)
+
 data class LocalAddr(val iface: String, val ip: String, val kind: String) {
     val label: String get() = "$kind  $ip  ($iface)"
 }
@@ -34,6 +37,9 @@ data class LocalAddr(val iface: String, val ip: String, val kind: String) {
 object ShareState {
     val items = CopyOnWriteArrayList<SharedItem>()
     val received = CopyOnWriteArrayList<ReceivedItem>()
+    val texts = CopyOnWriteArrayList<SharedText>()
+    /** Fixed for the life of the app, so an archive is the same bytes each time it is asked for (resuming). */
+    val startedAt = System.currentTimeMillis()
 
     @Volatile var token: String = newToken()
     @Volatile var port: Int = 0
@@ -41,6 +47,8 @@ object ShareState {
     @Volatile var tlsPort: Int = 0
     @Volatile var host: String? = null
     @Volatile var running: Boolean = false
+    /** AstraDrop is on screen (the idle auto-stop waits while it is). */
+    @Volatile var uiVisible: Boolean = false
 
     private val nextId = AtomicInteger(1)
     private val listeners = CopyOnWriteArraySet<() -> Unit>()
@@ -55,7 +63,7 @@ object ShareState {
     fun url(): String? {
         val h = host ?: return null
         if (!running || port <= 0) return null
-        return "http://$h:$port/$token/"
+        return "http://$h:$port/$token/?k=${Devices.ticket}"
     }
 
     fun addListener(l: () -> Unit) { listeners.add(l) }
@@ -83,6 +91,7 @@ object ShareState {
         var t = newToken()
         while (t == old) t = newToken()
         token = t
+        Devices.clear()
         notifyChanged()
     }
 
@@ -107,8 +116,19 @@ object ShareState {
         return true
     }
 
-    /** A new link code like `pelmeni-babushka`. */
-    private fun newToken(): String = LinkWords.pair()
+    /** Adds [text] for the iPhone (blank or a repeat of the last one is ignored). */
+    fun addText(text: String): Boolean {
+        val t = text.trim().take(MAX_TEXT)
+        if (t.isEmpty() || texts.any { it.text == t }) return false
+        texts.add(SharedText("x" + nextId.getAndIncrement(), t))
+        notifyChanged()
+        return true
+    }
+
+    const val MAX_TEXT = 100_000
+
+    /** A new random link code (see LinkCode). */
+    private fun newToken(): String = LinkCode.new()
 
     /** Private IPv4 addresses this phone can be reached on, hotspot first. */
     fun localAddresses(): List<LocalAddr> {
@@ -122,6 +142,7 @@ object ShareState {
                     if (a !is Inet4Address || !a.isSiteLocalAddress) continue
                     val ip = a.hostAddress ?: continue
                     val kind = when {
+                        name == OwnNetwork.iface -> "AstraDrop network"
                         name == "wlan0" && !ip.endsWith(".1") -> "Wi-Fi"
                         name.startsWith("ap") || name.startsWith("swlan") || name.startsWith("softap") ||
                             name.matches(Regex("wlan[1-9].*")) || ip.endsWith(".1") -> "Hotspot"
@@ -133,7 +154,7 @@ object ShareState {
             }
         } catch (_: Exception) {
         }
-        val order = mapOf("Hotspot" to 0, "Wi-Fi" to 1, "Other" to 2)
+        val order = mapOf("AstraDrop network" to 0, "Hotspot" to 1, "Wi-Fi" to 2, "Other" to 3)
         return out.sortedBy { order[it.kind] ?: 3 }
     }
 }

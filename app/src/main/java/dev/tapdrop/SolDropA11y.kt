@@ -7,7 +7,7 @@ import android.view.accessibility.AccessibilityEvent
  * Same as SolCube's SolCubeA11y: exists only so the "NFC on / off" pill can use
  * TYPE_ACCESSIBILITY_OVERLAY, the one window type an app may draw ABOVE the status bar (an app
  * overlay sits under it, and the notification icons drew over the pill). It does not read window
- * content or react to events. SolDrop switches it on through Shizuku with the NFC toggle.
+ * content or react to events. AstraDrop asks its engine to switch it on with Automatic NFC (some phones refuse; then Settings → Accessibility).
  */
 class SolDropA11y : AccessibilityService() {
     companion object {

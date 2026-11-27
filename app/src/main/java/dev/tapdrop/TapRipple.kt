@@ -27,7 +27,7 @@ import kotlin.random.Random
 /**
  * Top-edge champagne-gold NFC tap ripple (adapted from SolCube's RippleView AGSL shader),
  * plus sequential LRA haptics and Vivo's tap chime. Applied directly to MainActivity's root
- * view via RenderEffect.createRuntimeShaderEffect so it refracts the live SolDrop UI.
+ * view via RenderEffect.createRuntimeShaderEffect so it refracts the live AstraDrop UI.
  */
 class TapRipple(ctx: Context) {
 
@@ -127,7 +127,7 @@ class TapRipple(ctx: Context) {
                 val swell = 0.32f * sin(PI.toFloat() * st)
                 val swellR = 165f * dp
 
-                val washA = 0.50f * (wt / 0.25f).coerceIn(0f, 1f) * (1f - ((t - 0.70f) / 0.30f).coerceIn(0f, 1f))
+                val washA = 0.42f * (wt / 0.25f).coerceIn(0f, 1f) * (1f - ((t - 0.70f) / 0.30f).coerceIn(0f, 1f))
                 val orbIn = (t / 0.07f).coerceIn(0f, 1f)
                 val orbOut = ((t - 0.08f) / 0.16f).coerceIn(0f, 1f)
                 val orbA = orbIn * (1f - orbOut * orbOut * (3f - 2f * orbOut))
@@ -318,8 +318,11 @@ half4 main(float2 q) {
     }
     half3 col = acc / 5.0;
 
-    // colour wash in the wake (inside the wave front)
-    float inside = smoothstep(r + w * 0.6, r - w * 1.4, dist);
+    // colour wash riding just behind the crest: a band about two wave-widths deep that moves
+    // with it, so the screen behind the wave is clear again (it used to fill everything inside)
+    float front = clamp((r + w * 0.6 - dist) / (w * 0.8), 0.0, 1.0);
+    float tail = clamp((dist - (r - w * 2.2)) / (w * 1.3), 0.0, 1.0);
+    float inside = front * front * (3.0 - 2.0 * front) * tail * tail * (3.0 - 2.0 * tail);
     half4 film = wash(p);
     float wa = washA * inside * float(film.a);
     half lum = dot(col, half3(0.30, 0.59, 0.11));

@@ -16,7 +16,8 @@ import java.util.concurrent.ConcurrentHashMap
 object Previews {
     /** Photos above this many pixels are shown as a preview in the viewer. */
     const val MAX_FULL_PIXELS = 16_000_000L
-    private const val LONG_SIDE = 2560
+    const val MIME = "image/webp"
+    private const val LONG_SIDE = 2048
     private const val KEEP = 8
 
     private val dims = ConcurrentHashMap<String, Long>()
@@ -55,7 +56,7 @@ object Previews {
             return null
         }
         val bos = ByteArrayOutputStream()
-        bmp.compress(Bitmap.CompressFormat.JPEG, 88, bos)
+        bmp.compress(Bitmap.CompressFormat.WEBP_LOSSY, 82, bos)
         bmp.recycle()
         val bytes = bos.toByteArray()
         synchronized(cache) { cache[key] = bytes }

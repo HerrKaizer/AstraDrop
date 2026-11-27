@@ -5,7 +5,6 @@ import android.animation.AnimatorSet
 import android.animation.ObjectAnimator
 import android.animation.ValueAnimator
 import android.app.Activity
-import android.app.AlertDialog
 import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.IntentFilter
@@ -13,7 +12,8 @@ import android.graphics.BlendMode
 import android.graphics.RenderEffect
 import android.graphics.RuntimeShader
 import android.graphics.Shader
-import rikka.shizuku.Shizuku
+import dev.tapdrop.engine.Engine
+import dev.tapdrop.engine.PairingService
 import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
@@ -58,31 +58,14 @@ import com.google.zxing.qrcode.QRCodeWriter
 
 class MainActivity : Activity() {
 
-    private data class Palette(
-        val base: Int, val glows: List<Int>, val solid: Int,
-        val glass: Int, val sheen: Int, val stroke: Int, val tile: Int, val chip: Int, val field: Int,
-        val fg: Int, val sub: Int, val accent: Int, val accent2: Int, val warn: Int, val danger: Int,
-        /** Text/icon accent, text on filled buttons, filled-button rim (0 = none) and halo (0 = none). */
-        val link: Int, val onAccent: Int, val fillStroke: Int = 0, val halo: Int = 0,
-        /** Filled-button glass tint and highlight strength. */
-        val fill: Int, val fillShine: Float,
-    )
-
-    private val fontRegular: Typeface by lazy { googleSans(400) }
-    private val fontMedium: Typeface by lazy { googleSans(560) }
-    private val fontBold: Typeface by lazy { googleSans(680) }
-
-    private fun googleSans(weight: Int): Typeface = try {
-        Typeface.Builder(assets, "fonts/GoogleSansFlex.ttf")
-            .setFontVariationSettings("'wght' $weight")
-            .build() ?: Typeface.DEFAULT
-    } catch (_: Exception) {
-        Typeface.DEFAULT
-    }
+    private val fontRegular: Typeface get() = Look.font(this, 400)
+    private val fontMedium: Typeface get() = Look.font(this, 560)
+    private val fontBold: Typeface get() = Look.font(this, 680)
 
     private enum class State { READY, OFF, NO_NET, NO_NFC, NFC_OFF }
 
-    private lateinit var p: Palette
+    private lateinit var p: Look.Palette
+    private lateinit var ui: Ui
     private lateinit var thumbs: Thumbs
     private var nfc: NfcAdapter? = null
     private var userStopped = false
@@ -96,9 +79,10 @@ class MainActivity : Activity() {
     private lateinit var heroTitle: TextView
     private lateinit var heroSub: TextView
     private lateinit var primaryBtn: TextView
-    private lateinit var nfcAction: TextView
-    private lateinit var chipsRow: LinearLayout
-    private lateinit var linkView: TextView
+    private lateinit var tapWay: WayTile
+    private lateinit var scanWay: WayTile
+    private lateinit var wifiTile: WayTile
+    private lateinit var hotTile: WayTile
     private lateinit var sendTitle: TextView
     private lateinit var sendGrid: LinearLayout
     private lateinit var sendHint: TextView
@@ -106,33 +90,55 @@ class MainActivity : Activity() {
     private lateinit var recvTitle: TextView
     private lateinit var recvGrid: LinearLayout
     private lateinit var recvHint: TextView
-    private lateinit var hotspotBody: LinearLayout
-    private lateinit var chevron: ChevronBadgeView
-    private lateinit var ssidEdit: EditText
-    private lateinit var passEdit: EditText
     private var pulseAnim: AnimatorSet? = null
     private lateinit var scrollView: ScrollView
-    private lateinit var hotCard: LinearLayout
-    private lateinit var nfcToggle: TextView
-    private lateinit var nfcToggleNote: TextView
+    /** Shown section (0 Share, 1 Settings), each one's scroll position, and a way to switch from code. */
+    private var activeTab = 0
+    private val pageScrollY = IntArray(2)
+    private var showTab: (Int) -> Unit = {}
+    private lateinit var autoBtn: TextView
+    private lateinit var autoNote: TextView
+    private lateinit var autoText: TextView
+    private lateinit var netHint: TextView
+    private lateinit var transferBox: LinearLayout
+    private lateinit var transferText: TextView
+    private lateinit var transferBar: android.widget.ProgressBar
+    private lateinit var devBox: LinearLayout
+    private var devKey = ""
+    private var historyAllBtn: TextView? = null
+    private var historyClearBtn: TextView? = null
+    /** Devices already asked about in a dialog here (so each is asked once). */
+    private val asked = HashSet<String>()
+    private var wifiName: String? = null
+    private var visitShown = false
     private lateinit var rootFrame: FrameLayout
     private lateinit var tapRipple: TapRipple
     private var iconTint = 0
     private var iconKick: AnimatorSet? = null
     private val tapListener: () -> Unit = { triggerTapEffect() }
 
-    /** NFC switched on or off anywhere (quick settings, Shizuku): update the hero right away. */
+    /** NFC switched on or off anywhere (quick settings, Automatic NFC): update the hero right away. */
     private val nfcReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) = render()
     }
-    private val shizukuPerm = Shizuku.OnRequestPermissionResultListener { _, result ->
-        runOnUiThread {
-            renderNfcToggle()
-            if (result == PackageManager.PERMISSION_GRANTED && ShareState.running) NfcShizuku.set(this, true)
+    private val autoListener: () -> Unit = { render(); renderAuto() }
+    private val main = android.os.Handler(android.os.Looper.getMainLooper())
+    // networks come and go (hotspot on, Wi-Fi joined): look again every few seconds while on screen
+    private val netTick = object : Runnable {
+        override fun run() {
+            val before = addrs
+            refreshNetworks()
+            if (before != addrs) { ShareState.notifyChanged() }
+            // the Wi-Fi's name comes from the engine (apps need location access for it)
+            if (AutoNfc.engineUp) Thread {
+                val n = AutoNfc.wifiName(this@MainActivity)
+                if (n != wifiName) main.post { wifiName = n; renderNetworks() }
+            }.start()
+            // "connected" ends a few seconds after the iPhone's last request
+            if (visitShown != Visits.connected()) render()
+            main.postDelayed(this, 3000)
         }
     }
-    private val shizukuUp = Shizuku.OnBinderReceivedListener { runOnUiThread { renderNfcToggle() } }
-    private val shizukuDown = Shizuku.OnBinderDeadListener { runOnUiThread { renderNfcToggle() } }
 
     // ================================================================== lifecycle
 
@@ -148,10 +154,12 @@ class MainActivity : Activity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        setTheme(if (Look.isDark(this)) android.R.style.Theme_DeviceDefault_NoActionBar else android.R.style.Theme_DeviceDefault_Light_NoActionBar)
         super.onCreate(savedInstanceState)
+        ui = Ui(this)
         // a fresh start shares nothing yet, so anything cached is left over from last time
         if (ShareState.items.isEmpty()) Thread { cacheDir.listFiles()?.forEach { it.deleteRecursively() } }.start()
-        p = palette()
+        p = ui.p
         thumbs = Thumbs(this)
         nfc = NfcAdapter.getDefaultAdapter(this)
         tapRipple = TapRipple(this)
@@ -159,23 +167,18 @@ class MainActivity : Activity() {
         styleSystemBars()
         rootFrame = buildUi()
         setContentView(rootFrame)
-        if (Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 10)
-        }
+        // first run: the tour first, the notification permission once it's done (see onResume)
+        if (savedInstanceState == null && !TourActivity.seen(this)) startActivity(Intent(this, TourActivity::class.java))
         handleShareIntent(intent)
-        Shizuku.addRequestPermissionResultListener(shizukuPerm)
-        Shizuku.addBinderReceivedListenerSticky(shizukuUp)
-        Shizuku.addBinderDeadListener(shizukuDown)
+        AutoNfc.addListener(autoListener)
+        PairingService.addListener(autoListener)
     }
 
     override fun onDestroy() {
         iconKick?.cancel()
         tapRipple.release(rootFrame)
-        Shizuku.removeRequestPermissionResultListener(shizukuPerm)
-        Shizuku.removeBinderReceivedListener(shizukuUp)
-        Shizuku.removeBinderDeadListener(shizukuDown)
+        AutoNfc.removeListener(autoListener)
+        PairingService.removeListener(autoListener)
         super.onDestroy()
     }
 
@@ -194,10 +197,18 @@ class MainActivity : Activity() {
         setPreferredTag(true)
         registerReceiver(nfcReceiver, IntentFilter(NfcAdapter.ACTION_ADAPTER_STATE_CHANGED), RECEIVER_EXPORTED)
         render()
-        renderNfcToggle()
+        renderAuto()
+        AutoNfc.ensureEngine(this)
+        askNotifications()
+        ShareState.uiVisible = true
+        Visits.touch()
+        main.postDelayed(netTick, 3000)
     }
 
     override fun onPause() {
+        ShareState.uiVisible = false
+        Visits.touch()
+        main.removeCallbacks(netTick)
         try { unregisterReceiver(nfcReceiver) } catch (_: Exception) {}
         setPreferredTag(false)
         ShareState.removeTapListener(tapListener)
@@ -205,6 +216,16 @@ class MainActivity : Activity() {
         tapRipple.cancel(rootFrame)
         setPulse(false)
         super.onPause()
+    }
+
+    /** Notifications keep sharing running in the background; asked once, after the tour. */
+    private fun askNotifications() {
+        if (Build.VERSION.SDK_INT < 33 || !TourActivity.seen(this)) return
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) return
+        val pr = getSharedPreferences("tapdrop", MODE_PRIVATE)
+        if (pr.getBoolean("notif_asked", false)) return
+        pr.edit().putBoolean("notif_asked", true).apply()
+        requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 10)
     }
 
     /** While TapDrop is on screen, our tag wins over other apps that emulate the same AID (e.g. Bada). */
@@ -222,6 +243,9 @@ class MainActivity : Activity() {
 
     private fun handleShareIntent(intent: Intent?) {
         intent ?: return
+        when (intent.action) {
+            ACTION_QUICK -> { intent.action = Intent.ACTION_MAIN; quickStart(); return }
+        }
         val uris = mutableListOf<Uri>()
         when (intent.action) {
             Intent.ACTION_SEND -> streamExtra(intent)?.let { uris += it }
@@ -229,6 +253,12 @@ class MainActivity : Activity() {
             else -> return
         }
         intent.clipData?.let { c -> for (i in 0 until c.itemCount) c.getItemAt(i).uri?.let { if (it !in uris) uris += it } }
+        // text or a link shared from another app (no file with it)
+        if (uris.isEmpty() && intent.action == Intent.ACTION_SEND) {
+            intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()?.let { addText(it) }
+            intent.action = Intent.ACTION_MAIN
+            return
+        }
         addUris(uris, persist = false)
         intent.action = Intent.ACTION_MAIN
     }
@@ -262,6 +292,36 @@ class MainActivity : Activity() {
             startServer()
         }
         render()
+    }
+
+    private fun addText(text: String) {
+        if (ShareState.addText(text)) {
+            userStopped = false
+            startServer()
+        }
+        render()
+    }
+
+    /** The Text tile: type or paste something for the iPhone (starts with what's on the clipboard). */
+    private fun askText() {
+        val clip = try {
+            getSystemService(ClipboardManager::class.java).primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString()
+        } catch (_: Exception) { null }
+        val box = android.widget.EditText(this).apply {
+            setText(clip ?: "")
+            hint = t("Text or a link")
+            textSize = 16f
+            setTextColor(p.fg)
+            setHintTextColor(p.sub)
+            minLines = 3
+            maxLines = 8
+            gravity = Gravity.TOP or Gravity.START
+            setPadding(14.dp, 12.dp, 14.dp, 12.dp)
+            background = rounded(p.tile, 14.dp)
+            selectAll()
+        }
+        ui.dialog(t("Send text"), t("It shows up on the iPhone's page with a Copy button."), content = box,
+            positive = "Send", negative = "Cancel", onPositive = { addText(box.text.toString()) })
     }
 
     @Deprecated("framework Activity result API")
@@ -334,92 +394,369 @@ class MainActivity : Activity() {
 
     // ================================================================== rendering
 
+    private fun t(s: String) = I18n.t(s)
+
     private fun render() {
         val s = state()
         val tint = when (s) {
-            State.READY -> p.link
+            State.READY, State.NFC_OFF, State.NO_NFC -> p.link
             State.OFF -> p.sub
-            else -> p.warn
+            State.NO_NET -> p.warn
         }
-        heroTitle.text = when (s) {
-            State.READY -> "Ready to tap"
-            State.OFF -> "Sharing is off"
-            State.NO_NET -> "No network"
-            State.NO_NFC -> "No NFC on this phone"
-            State.NFC_OFF -> "NFC is off"
+        val autoOn = AutoNfc.switchingOn
+        val visit = Visits.connected() && ShareState.running
+        visitShown = visit
+        heroTitle.text = when {
+            visit -> t("%s connected").format(Devices.connectedLabel())
+            s == State.READY -> t("Ready")
+            s == State.NFC_OFF || s == State.NO_NFC -> t("Ready to scan")
+            s == State.NO_NET -> t("Connect to a network")
+            else -> t("Sharing is paused")
         }
-        heroSub.text = when (s) {
-            State.READY -> "Hold an iPhone against the back of this phone, then tap the banner on the iPhone."
-            State.OFF -> "Turn sharing on to let an iPhone tap in."
-            State.NO_NET -> "Join a Wi-Fi network or turn on your hotspot."
-            State.NO_NFC -> "Use the link QR instead."
-            State.NFC_OFF -> "Turn NFC on to share by tapping."
+        heroSub.text = when {
+            visit && Devices.connected().size > 1 -> t("The page is open on several devices. Files you add here show up there by themselves.")
+            visit -> t("The page is open on the %s. Files you add here show up there by themselves.").format(Devices.connectedLabel())
+            s == State.READY -> t("Hold the iPhone to the back of this phone, or let it scan the code.")
+            s == State.NFC_OFF -> if (autoOn) t("Turning NFC on…") else t("The iPhone can scan the code. To tap instead, turn on NFC.")
+            s == State.NO_NFC -> t("This phone has no NFC, so the iPhone scans the code.")
+            s == State.NO_NET -> t("Both phones need to be on the same Wi-Fi, or on this phone's hotspot (below).")
+            else -> t("The iPhone can't open your page until sharing starts again.")
         }
-        // own glass disc: gold with the same rim and glow as the filled buttons when ready to tap,
+        // own glass disc: gold with the same rim and glow as the filled buttons when ready,
         // otherwise clear glass tinted by the state. Rebuilt only when that changes (new glass = shader compile)
-        val ready = s == State.READY
+        val ready = s == State.READY || s == State.NFC_OFF || s == State.NO_NFC
         icon.imageTintList = ColorStateList.valueOf(if (ready) p.onAccent else tint)
         val discKey = if (ready) 1 else tint
         if (iconTint != discKey) {
             iconTint = discKey
             iconBg.background = if (ready) accentGradient(32.dp) else glass(32.dp, alpha(tint, if (isDark()) 0.16f else 0.12f))
-            // the gold disc glows instead (an elevation shadow under the halo looked dirty)
             iconBg.elevation = if (ready && p.halo != 0) 0f else if (isDark()) 4.dp.toFloat() else 5.dp.toFloat()
         }
         pulse.background = oval(alpha(tint, 0.35f))
-        setPulse(s == State.READY)
-        nfcAction.visibility = if (s == State.NFC_OFF) View.VISIBLE else View.GONE
+        setPulse(s == State.READY && !visit)
 
-        if (ShareState.running) {
-            primaryBtn.text = "Stop sharing"
-            primaryBtn.setTextColor(p.danger)
-            primaryBtn.background = ripple(glass(28.dp, alpha(p.danger, if (isDark()) 0.16f else 0.10f)), 28.dp)
-            primaryBtn.foreground = null
-        } else {
-            primaryBtn.text = "Start sharing"
-            primaryBtn.setTextColor(p.onAccent)
-            primaryBtn.background = accentGradient(28.dp)
-            primaryBtn.foreground = ripple(null, 28.dp)   // as an overlay: a ripple background would clip the halo
-        }
+        primaryBtn.visibility = if (s == State.OFF) View.VISIBLE else View.GONE
+        renderTransfers()
+        renderDevices()
+        askPending()
 
-        renderChips()
-        linkView.text = ShareState.url() ?: ""
-        linkView.visibility = if (ShareState.url() != null) View.VISIBLE else View.GONE
+        // the two ways to connect: always shown, greyed when they can't work right now
+        val net = s != State.NO_NET && s != State.OFF
+        val engine = AutoNfc.enabled(this) && AutoNfc.setUp(this)
+        tapWay.set(
+            when {
+                nfc == null -> t("Not on this phone")
+                autoOn -> t("Turning NFC on…")
+                s == State.NFC_OFF -> t("NFC off · Tap to turn on")
+                engine -> t("NFC on · Tap to turn off")
+                else -> t("NFC on · Hold phones together")
+            },
+            active = net && nfc?.isEnabled == true, warn = s == State.NFC_OFF && !autoOn, dim = nfc == null || nfc?.isEnabled != true,
+        )
+        scanWay.set(t("QR code of the link"), active = net, warn = false, dim = !net)
 
+        renderNetworks()
         renderSendGrid()
         renderRecvGrid()
+        settingRefresh.forEach { it() }
     }
 
-    private fun renderChips() {
-        chipsRow.removeAllViews()
-        if (addrs.isEmpty()) {
-            chipsRow.addView(chip("No network", selected = false, warn = true) { refreshNetworks(); render() })
-        }
-        for (a in addrs) {
-            chipsRow.addView(chip("${a.kind}  ${a.ip}", a.ip == ShareState.host) {
-                ShareState.host = a.ip
-                ShareState.notifyChanged()
+    /** What's moving right now, under the status: "Sending IMG_1234.jpg · 45 %" with a bar. */
+    private fun renderTransfers() {
+        val list = Visits.transfers()
+        if (list.isEmpty()) { transferBox.visibility = View.GONE; return }
+        transferBox.visibility = View.VISIBLE
+        val tr = list.maxByOrNull { it.total } ?: return
+        val f = if (tr.total > 0) (tr.done.toFloat() / tr.total).coerceIn(0f, 1f) else 0f
+        val what = if (tr.up) t("Receiving %s") else t("Sending %s")
+        val more = if (list.size > 1) "  +" + (list.size - 1) else ""
+        transferText.text = what.format(tr.name) + more + (if (tr.total > 0) "  ·  ${(f * 100).toInt()} %" else "")
+        transferBar.progress = (f * 1000).toInt()
+    }
+
+    /**
+     * Each phone with the page open: "iPhone · has 12 of 30" and a Remove pill (it then has
+     * to be tapped or scan again). Rebuilt only when something in it changes.
+     */
+    private fun renderDevices() {
+        val devs = if (ShareState.running) Devices.connected() else emptyList()
+        val key = devs.joinToString { d -> d.id + ":" + Devices.progress(d) }
+        if (key == devKey) return
+        devKey = key
+        devBox.removeAllViews()
+        devBox.visibility = if (devs.isEmpty()) View.GONE else View.VISIBLE
+        devs.forEachIndexed { i, d ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+                clipChildren = false; clipToPadding = false
+            }
+            val (have, all) = Devices.progress(d)
+            val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            col.addView(TextView(this).apply {
+                text = d.label(); textSize = 15f; setTextColor(p.fg); typeface = fontMedium
             })
+            col.addView(TextView(this).apply {
+                text = when {
+                    all == 0 -> t("Has the page open")
+                    have >= all -> I18n.plural(all, "Has %d file", "Has all %d files")
+                    else -> t("Has %d of %d files").format(have, all)
+                }
+                textSize = 13f; setTextColor(if (all > 0 && have >= all) p.link else p.sub); typeface = fontRegular
+            })
+            row.addView(col, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            row.addView(smallPill("Remove") {
+                ui.dialog(t("Remove %s?").format(d.label()), t("Its page stops working. To connect again, it taps or scans again."),
+                    positive = "Remove", negative = "Cancel", onPositive = { Devices.remove(d.id); render() })
+            }, pillParams(first = true))
+            devBox.addView(row, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { if (i > 0) topMargin = 10.dp })
         }
-        chipsRow.addView(chip("Refresh", selected = false) {
-            refreshNetworks()
+    }
+
+    /** A new phone waiting to be let in (Settings → Ask before a device joins): ask here too. */
+    private fun askPending() {
+        val d = Devices.pending().firstOrNull { it.id !in asked } ?: return
+        asked += d.id
+        ui.dialog(t("%s wants to connect").format(d.label()), t("Allow it to see the shared files and send you files?"),
+            positive = "Allow", negative = "Block",
+            onPositive = { Devices.approve(d.id); cancelAsk(d) },
+            onNegative = { Devices.remove(d.id); cancelAsk(d) })
+    }
+
+    private fun cancelAsk(d: Devices.Device) {
+        getSystemService(android.app.NotificationManager::class.java).cancel(0x20000 + (d.id.hashCode() and 0xFFF))
+    }
+
+    private fun onPrimary() {
+        userStopped = false; refreshNetworks(); startServer()
+    }
+
+    /** Tap tile: switches NFC on or off (Auto mode does it right here; otherwise the NFC page opens). */
+    private fun onTap() {
+        val a = nfc
+        when {
+            a == null -> toast(t("This phone has no NFC. Use Scan instead."))
+            AutoNfc.enabled(this) && AutoNfc.setUp(this) -> { AutoNfc.nfcNow(this, !a.isEnabled); render() }
+            else -> Nav.nfc(this)
+        }
+    }
+
+    /** Long press on Tap: how tapping works. */
+    private fun tapHelp() {
+        ui.dialog(t("How to tap"),
+            t("1.  Unlock the iPhone.\n2.  Hold the top of the iPhone against the back of this phone, near the camera, for a second.\n3.  Tap the banner that appears on the iPhone.\n\nNothing happens? The iPhone may have NFC reading switched off; use Scan instead."),
+            positive = t("Got it"))
+    }
+
+    private fun onScan() {
+        val u = ShareState.url()
+        when {
+            state() == State.NO_NET -> toast(t("Connect both phones to one network first"))
+            u == null -> toast(t("Sharing hasn't started yet"))
+            else -> showQrDialog(u, t("Scan with the iPhone"),
+                t("This code holds the link to the shared files. Open the Camera on the iPhone, point it at the code and tap the yellow link."),
+                live = { ShareState.url() })
+        }
+    }
+
+    private fun hotspotOn() = addrs.any { it.kind == "Hotspot" || it.kind == "AstraDrop network" }
+
+    private fun renderNetworks() {
+        val wifi = addrs.firstOrNull { it.kind == "Wi-Fi" }
+        val hot = addrs.firstOrNull { it.kind == "Hotspot" || it.kind == "AstraDrop network" }
+        val cur = addrs.firstOrNull { it.ip == ShareState.host }
+        val engine = AutoNfc.enabled(this) && AutoNfc.setUp(this)
+        wifiTile.set(if (wifi != null) wifiName ?: t("Connected") else t("Not connected · Tap to join"),
+            active = wifi != null && cur == wifi, warn = false, dim = wifi == null)
+        val hotName = if (OwnNetwork.active) OwnNetwork.ssid else savedHotspot()?.first
+        val known = hotName != null && !OwnNetwork.active && Visits.joined(this, hotName)
+        hotTile.set(
+            when {
+                AutoNfc.hotspotBusy || OwnNetwork.starting -> t("Turning on…")
+                hot != null -> (hotName ?: t("On")) + if (known) " · " + t("iPhone knows it") else ""
+                engine -> t("Off · Tap to turn on")
+                else -> t("Off · Tap to set up")
+            },
+            active = hot != null && cur == hot, warn = false, dim = hot == null && !AutoNfc.hotspotBusy,
+        )
+        // anything else (Ethernet, VPN...) only when it's the one in use
+        val other = cur?.takeIf { it.kind == "Other" }
+        netHint.text = when {
+            cur == null -> t("Join a Wi-Fi network, or tap Hotspot.")
+            cur == hot && OwnNetwork.active -> t("The iPhone joins “%s” by scanning its Wi-Fi code (tap Hotspot).").format(OwnNetwork.ssid)
+            cur == hot && known -> t("The iPhone has joined “%s” before and connects by itself.").format(hotName)
+            cur == hot -> if (hotName != null) t("The iPhone must be connected to “%s”. Tap Hotspot for a code it can scan.").format(hotName)
+                else t("The iPhone must be connected to this phone's hotspot. Tap Hotspot for a code it can scan.")
+            cur == wifi -> t("The iPhone must be on the same Wi-Fi as this phone.")
+            other != null -> t("Sharing over %s. The iPhone must be on the same network.").format(other.iface)
+            else -> t("The iPhone must be on the same network as this phone.")
+        }
+    }
+
+    private fun onWifiTile() {
+        val wifi = addrs.firstOrNull { it.kind == "Wi-Fi" }
+        if (wifi == null) { Nav.wifi(this); return }
+        ShareState.host = wifi.ip
+        ShareState.notifyChanged()
+        // back on Wi-Fi: the hotspot (or quick network) isn't needed any more
+        if (OwnNetwork.active) OwnNetwork.stop()
+        if (hotspotOn() && AutoNfc.enabled(this) && AutoNfc.setUp(this)) AutoNfc.hotspotOff(this) { refreshNetworks(); render() }
+    }
+
+    /** Use the hotspot once it has an address (that takes a moment after switching on). */
+    private fun preferHotspot(tries: Int = 20) {
+        refreshNetworks()
+        val hot = addrs.firstOrNull { it.kind == "Hotspot" || it.kind == "AstraDrop network" }
+        if (hot != null) { ShareState.host = hot.ip; ShareState.notifyChanged(); return }
+        if (tries > 0) main.postDelayed({ preferHotspot(tries - 1) }, 500)
+    }
+
+    /**
+     * Hotspot tile. Auto mode: switch on the phone's own hotspot and show its Wi-Fi code (the iPhone
+     * remembers it, so the code is needed only once). Without it: a code for a hotspot that's
+     * already on, or AstraDrop's quick network (new name and password every time).
+     */
+    private fun onHotspotTile(forceCode: Boolean = false) {
+        val engine = AutoNfc.enabled(this) && AutoNfc.setUp(this)
+        when {
+            AutoNfc.hotspotBusy || OwnNetwork.starting -> {}
+            OwnNetwork.active -> showOwnNetQr()
+            hotspotOn() -> {
+                preferHotspot(0)
+                val saved = savedHotspot()
+                when {
+                    saved == null -> if (engine) Thread {
+                        val info = AutoNfc.hotspotInfo(this)
+                        main.post { if (info != null) { saveHotspot(info.ssid, info.pass); offerHotspotCode(info.ssid, info.pass, forceCode) } else askHotspotDetails() }
+                    }.start() else askHotspotDetails()
+                    else -> offerHotspotCode(saved.first, saved.second, forceCode)
+                }
+            }
+            engine -> {
+                AutoNfc.hotspotOn(this) { info, err ->
+                    if (info == null) {
+                        toast(err ?: t("Couldn't turn the hotspot on"))
+                        render()
+                        return@hotspotOn
+                    }
+                    saveHotspot(info.ssid, info.pass)
+                    if (!ShareState.running) { userStopped = false; startServer() }
+                    preferHotspot()
+                    offerHotspotCode(info.ssid, info.pass, forceCode)
+                }
+                render()
+            }
+            else -> ui.dialog(t("Use a hotspot"),
+                t("The iPhone can join this phone instead of Wi-Fi.") + "\n\n" +
+                    t("Quick network: AstraDrop makes one just for the iPhone, nothing to type. Android picks a new name and password each time, so the iPhone scans a code every time.") + "\n\n" +
+                    t("Your own hotspot: the iPhone remembers it after scanning once. Turn it on in Settings and come back. Auto mode can turn it on for you."),
+                positive = t("Quick network"), negative = t("Hotspot settings"),
+                onNegative = { Nav.hotspot(this) }, onPositive = { startOwnNetwork() })
+        }
+    }
+
+    /** An iPhone that joined this hotspot before connects by itself: no code unless asked (long press). */
+    private fun offerHotspotCode(ssid: String, pass: String, force: Boolean) {
+        if (!force && Visits.joined(this, ssid)) {
+            toast(t("The iPhone joins “%s” by itself. Long-press Hotspot for its code.").format(ssid))
+            return
+        }
+        showHotspotQr(ssid, pass)
+    }
+
+    private fun savedHotspot(): Pair<String, String>? {
+        val pr = getSharedPreferences("tapdrop", MODE_PRIVATE)
+        val ssid = pr.getString("ssid", null)?.takeIf { it.isNotBlank() } ?: return null
+        return ssid to (pr.getString("pass", "") ?: "")
+    }
+
+    private fun saveHotspot(ssid: String, pass: String) {
+        val old = savedHotspot()
+        // a new password means the iPhone has to scan again
+        if (old != null && (old.first != ssid || old.second != pass)) Visits.forgetJoined(this, old.first)
+        getSharedPreferences("tapdrop", MODE_PRIVATE).edit().putString("ssid", ssid).putString("pass", pass).apply()
+    }
+
+    /** Without Auto mode Android doesn't tell apps the hotspot's password: ask once. */
+    private fun askHotspotDetails() {
+        val saved = savedHotspot()
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val name = field(t("Hotspot name")).apply { setText(saved?.first ?: "") }
+        val pass = field(t("Hotspot password")).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+            setText(saved?.second ?: "")
+        }
+        box.addView(name, LinearLayout.LayoutParams(MATCH_PARENT, 50.dp))
+        box.addView(pass, LinearLayout.LayoutParams(MATCH_PARENT, 50.dp).apply { topMargin = 8.dp })
+        ui.dialog(t("Your hotspot"),
+            t("Enter its name and password once (you'll find them in Settings → Hotspot). AstraDrop turns them into a code the iPhone can scan."),
+            content = box, positive = t("Show code"), negative = t("Hotspot settings"),
+            onNegative = { Nav.hotspot(this) },
+            onPositive = {
+                val s = name.text.toString().trim()
+                if (s.isEmpty()) toast(t("Enter the hotspot name first"))
+                else { saveHotspot(s, pass.text.toString()); showHotspotQr(s, pass.text.toString()) }
+            })
+    }
+
+    private fun showHotspotQr(ssid: String, pass: String) {
+        showQrDialog(OwnNetwork.wifiQr(ssid, pass), t("Join “%s”").format(ssid),
+            t("On the iPhone, open the Camera, point it at this code and tap Join. It remembers this hotspot, so next time it joins by itself."),
+            negative = t("Edit"), onNegative = { askHotspotDetails() }.takeIf { !(AutoNfc.enabled(this) && AutoNfc.setUp(this)) })
+    }
+
+    private fun startOwnNetwork() {
+        if (OwnNetwork.active || OwnNetwork.starting) return
+        if (checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES), REQ_NEARBY)
+            return
+        }
+        OwnNetwork.start(this) { err ->
+            if (err != null) toast(t(err))
+            else {
+                if (!ShareState.running) { userStopped = false; startServer() }
+                preferHotspot()
+                OwnNetwork.ssid?.let { showOwnNetQr() }
+            }
             render()
-            toast("Networks refreshed")
-        }.apply {
-            val ic = getDrawable(R.drawable.ic_refresh)!!.mutate().apply { setTint(p.fg); setBounds(0, 0, 17.dp, 17.dp) }
-            setCompoundDrawablesRelative(ic, null, null, null)
-            compoundDrawablePadding = 7.dp
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(12.dp, paddingTop, 15.dp, paddingBottom)
-        })
+        }
+        render()
+    }
+
+    private fun showOwnNetQr() {
+        val ssid = OwnNetwork.ssid ?: return
+        showQrDialog(OwnNetwork.wifiQr(ssid, OwnNetwork.pass), t("Join “%s”").format(ssid),
+            t("On the iPhone, open the Camera, point it at this code and tap Join. Then tap Scan or hold the phones together."),
+            negative = t("Turn off"), onNegative = { OwnNetwork.stop(); main.postDelayed({ refreshNetworks(); render() }, 500) })
+    }
+
+    /** Quick Settings tile: ready to share; with Auto mode the hotspot goes on too (NFC already does). */
+    private fun quickStart() {
+        showTab(0)
+        userStopped = false
+        startServer()
+        if (AutoNfc.enabled(this) && AutoNfc.setUp(this) && !hotspotOn()) main.postDelayed({ onHotspotTile() }, 300)
+    }
+
+    @Deprecated("framework permission API")
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        val ok = grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED
+        when (requestCode) {
+            REQ_NEARBY -> if (ok) startOwnNetwork() else toast(t("AstraDrop needs Nearby devices to create a network"))
+        }
     }
 
     private fun renderSendGrid() {
         val items = ShareState.items.toList()
-        sendTitle.text = if (items.isEmpty()) "Sending" else "Sending  ·  ${items.size}"
-        clearBtn.visibility = if (items.isEmpty()) View.GONE else View.VISIBLE
-        sendHint.visibility = if (items.isEmpty()) View.VISIBLE else View.GONE
-        val tiles = items.map { item ->
+        val texts = ShareState.texts.toList()
+        val n = items.size + texts.size
+        sendTitle.text = if (n == 0) t("To the iPhone") else t("To the iPhone") + "  ·  $n"
+        clearBtn.visibility = if (n == 0) View.GONE else View.VISIBLE
+        sendHint.visibility = if (n == 0) View.VISIBLE else View.GONE
+        val textTiles = texts.map { st ->
+            textTile(st.text, onRemove = { ShareState.texts.removeAll { it.id == st.id }; ShareState.notifyChanged() }) { showText(st.text, null) }
+        }
+        val tiles = textTiles + items.map { item ->
             mediaTile(item.orig ?: item.uri, item.origMime ?: item.mime, item.name, onRemove = {
                 ShareState.items.removeAll { it.id == item.id }
                 ThumbStore.forget(item.uri)
@@ -427,23 +764,142 @@ class MainActivity : Activity() {
                 Compressor.forget(item)
                 ShareState.notifyChanged()
             }, rawId = item.id, size = item.size, onClick = { openViewer(item.orig ?: item.uri, item.origMime ?: item.mime) })
-        } + addTile()
+        } + addTile(t("Photos")) { pickMedia() } + addTile(t("Files")) { pickFiles() } + addTile(t("Text")) { askText() }
         fillGrid(sendGrid, tiles)
     }
 
+    private var recvKey = ""
+    private var pruned = false
+
+    /** Everything the iPhone has sent (kept between sessions): the newest 9 here, the rest under All. */
     private fun renderRecvGrid() {
-        val got = ShareState.received.toList()
-        recvTitle.text = if (got.isEmpty()) "Received" else "Received  ·  ${got.size}"
+        if (!pruned) { pruned = true; Thread { History.prune(applicationContext) }.start() }
+        val got = History.list(this)
+        val key = got.size.toString() + ":" + got.firstOrNull()?.time
+        if (key == recvKey) return
+        recvKey = key
+        recvTitle.text = if (got.isEmpty()) t("From the iPhone") else t("From the iPhone") + "  ·  ${got.size}"
         recvHint.visibility = if (got.isEmpty()) View.VISIBLE else View.GONE
         recvGrid.visibility = if (got.isEmpty()) View.GONE else View.VISIBLE
-        fillGrid(recvGrid, got.map { r -> mediaTile(r.uri, r.mime, r.name, null) { openViewer(r.uri, r.mime) } })
+        historyAllBtn?.visibility = if (got.size > RECV_SHOWN) View.VISIBLE else View.GONE
+        historyClearBtn?.visibility = if (got.isEmpty()) View.GONE else View.VISIBLE
+        fillGrid(recvGrid, got.take(RECV_SHOWN).map { historyTile(it) })
+    }
+
+    private fun historyTile(e: History.Entry): View {
+        val tile = if (e.isText) textTile(e.text, null) { showText(e.text, e) }
+        else mediaTile(e.uri!!, e.mime, e.name, null) { openViewer(e.uri, e.mime) }
+        tile.setOnLongClickListener { historyMenu(e); true }
+        return tile
+    }
+
+    /** Long press on something received: open it, share it on, or take it off the list. */
+    private fun historyMenu(e: History.Entry) {
+        val opts = listOf(t("Open"), t("Share"), t("Remove from the list"))
+        ui.choose(if (e.isText) t("Text") else e.name, opts, -1) { i ->
+            when (i) {
+                0 -> if (e.isText) showText(e.text, e) else openViewer(e.uri!!, e.mime)
+                1 -> {
+                    val send = Intent(Intent.ACTION_SEND)
+                    if (e.isText) send.setType("text/plain").putExtra(Intent.EXTRA_TEXT, e.text)
+                    else send.setType(e.mime).putExtra(Intent.EXTRA_STREAM, e.uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    try { startActivity(Intent.createChooser(send, null)) } catch (_: Exception) {}
+                }
+                2 -> History.remove(this, e)
+            }
+        }
+    }
+
+    /** All received, newest first, as a list. */
+    private fun showHistory() {
+        val got = History.list(this)
+        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        var dlg: android.app.Dialog? = null
+        val fmt = java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT)
+        for (e in got) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(4.dp, 10.dp, 4.dp, 10.dp)
+                background = ripple(null, 12.dp)
+                setOnClickListener { dlg?.dismiss(); if (e.isText) showText(e.text, e) else openViewer(e.uri!!, e.mime) }
+                setOnLongClickListener { dlg?.dismiss(); historyMenu(e); true }
+            }
+            row.addView(TextView(this).apply {
+                text = if (e.isText) e.text.replace('\n', ' ') else e.name
+                maxLines = 2; ellipsize = android.text.TextUtils.TruncateAt.END
+                textSize = 15f; setTextColor(p.fg); typeface = fontMedium
+            })
+            row.addView(TextView(this).apply {
+                text = fmt.format(java.util.Date(e.time)) + (if (e.from.isNotEmpty()) "  ·  " + t(e.from) else "")
+                textSize = 12.5f; setTextColor(p.sub); typeface = fontRegular
+            })
+            list.addView(row)
+        }
+        dlg = ui.dialog(t("Received"), null, content = list, positive = "Done", negative = "Clear the list", onNegative = { askClearHistory() })
+    }
+
+    /** Empties the received list (the files themselves stay in Gallery and Downloads). */
+    private fun askClearHistory() {
+        ui.dialog(t("Clear the list?"), t("The files stay in your Gallery and Downloads; only this list is emptied."),
+            positive = "Clear", negative = "Cancel", onPositive = { History.clear(this) })
+    }
+
+    /** A text: shown in full, with Copy (and Open for a link). */
+    private fun showText(text: String, e: History.Entry?) {
+        val body = TextView(this).apply {
+            this.text = text
+            textSize = 15.5f; setTextColor(p.fg); typeface = fontRegular
+            setTextIsSelectable(true)
+            setLineSpacing(0f, 1.15f)
+            android.text.util.Linkify.addLinks(this, android.text.util.Linkify.WEB_URLS)
+        }
+        val link = linkIn(text)
+        ui.dialog(if (e != null) t("Text from %s").format(t(e.from.ifEmpty { "iPhone" })) else t("Text"), null, content = body,
+            positive = "Copy", negative = if (link != null) "Open" else "Close",
+            onPositive = {
+                getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("AstraDrop", text))
+                toast(t("Copied"))
+            },
+            onNegative = { if (link != null) try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(link))) } catch (_: Exception) {} })
+    }
+
+    /** A square tile showing the start of a text. */
+    private fun textTile(text: String, onRemove: (() -> Unit)?, onClick: () -> Unit): View {
+        val tile = SquareFrame(this).apply {
+            background = GradientDrawable().apply {
+                cornerRadius = 14.dp.toFloat()
+                setColor(p.tile)
+                setStroke(1.dp, p.stroke)
+            }
+            clipToOutline = true
+            foreground = ripple(null, 14.dp)
+            setOnClickListener { onClick() }
+        }
+        tile.addView(TextView(this).apply {
+            this.text = text
+            textSize = 12.5f; setTextColor(p.fg); typeface = fontRegular
+            maxLines = 5; ellipsize = android.text.TextUtils.TruncateAt.END
+            setPadding(10.dp, 10.dp, 10.dp, 10.dp)
+        }, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+        tile.addView(label("Aa", 11f, Color.WHITE, bold = true).apply {
+            background = rounded(Color.argb(150, 0, 0, 0), 10.dp)
+            setPadding(7.dp, 2.dp, 7.dp, 2.dp)
+        }, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.START).apply { setMargins(6.dp, 0, 0, 6.dp) })
+        if (onRemove != null) {
+            tile.addView(label("✕", 12f, Color.WHITE, bold = true).apply {
+                gravity = Gravity.CENTER
+                background = oval(Color.argb(150, 0, 0, 0))
+                setOnClickListener { onRemove() }
+            }, FrameLayout.LayoutParams(26.dp, 26.dp, Gravity.TOP or Gravity.END).apply { setMargins(0, 6.dp, 6.dp, 0) })
+        }
+        return tile
     }
 
     private fun openViewer(uri: Uri, mime: String) {
         try {
             startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
         } catch (_: Exception) {
-            toast("No app can open this file")
+            toast(t("No app can open this file"))
         }
     }
 
@@ -475,70 +931,32 @@ class MainActivity : Activity() {
         return Bitmap.createBitmap(px, size, size, Bitmap.Config.ARGB_8888)
     }
 
-    private fun showQrDialog(text: String, title: String, message: String) {
+    /**
+     * [live]: the link changes once a phone has used it (each one works once), so the code is
+     * redrawn, and the dialog closes when a new phone has joined with it.
+     */
+    private fun showQrDialog(text: String, title: String, message: String, negative: String? = null, onNegative: (() -> Unit)? = null, live: (() -> String?)? = null) {
         val bmp = try { qrBitmap(text) } catch (e: Exception) { toast("QR failed: ${e.message}"); return }
-        val box = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(24.dp, 24.dp, 24.dp, 20.dp)
-        }
-        box.addView(label(title, 21f, p.fg).apply { typeface = fontBold })
-        box.addView(label(message, 15f, p.sub).apply { setPadding(0, 6.dp, 0, 0); setLineSpacing(0f, 1.15f) })
         val img = ImageView(this).apply {
             setImageBitmap(bmp)
             adjustViewBounds = true
             setPadding(14.dp, 14.dp, 14.dp, 14.dp)
             background = rounded(Color.WHITE, 18.dp)
         }
-        box.addView(img, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = 18.dp })
-        val dialog = AlertDialog.Builder(this).setView(box).create()
-        box.addView(pillButton("Done", filled = true) { dialog.dismiss() },
-            LinearLayout.LayoutParams(MATCH_PARENT, 50.dp).apply { topMargin = 18.dp })
-        dialog.show()
-        styleGlassDialog(dialog)
-    }
-
-    /** Frosted dialog: blurs the screen behind it where the device supports window blur (Android 12+). */
-    private fun styleGlassDialog(dialog: AlertDialog) {
-        val w = dialog.window ?: return
-        var blur = false
-        if (Build.VERSION.SDK_INT >= 31) {
-            blur = getSystemService(android.view.WindowManager::class.java).isCrossWindowBlurEnabled
-            if (blur) {
-                w.addFlags(android.view.WindowManager.LayoutParams.FLAG_BLUR_BEHIND)
-                w.attributes = w.attributes.apply { blurBehindRadius = 24.dp }
-                w.setBackgroundBlurRadius(40.dp)
+        val d = ui.dialog(title, message, content = img, positive = "Done", negative = negative.takeIf { onNegative != null }, onNegative = onNegative)
+        if (live != null) {
+            var shown = text
+            val before = Devices.all().size
+            val l: () -> Unit = {
+                val u = live()
+                if (Devices.all().size > before) d.dismiss()
+                else if (u != null && u != shown) {
+                    shown = u
+                    try { img.setImageBitmap(qrBitmap(u)) } catch (_: Exception) {}
+                }
             }
-        }
-        // without real blur, a more opaque pane keeps the text readable
-        val fill = alpha(p.solid, if (blur) (if (isDark()) 0.55f else 0.62f) else 0.96f)
-        w.setBackgroundDrawable(glass(28.dp, fill, level = 0))
-        w.setDimAmount(if (isDark()) 0.45f else 0.18f)
-    }
-
-    private fun showWifiQr() {
-        val ssid = ssidEdit.text.toString()
-        val pass = passEdit.text.toString()
-        if (ssid.isBlank()) {
-            toast("Enter your hotspot name first")
-            return
-        }
-        getSharedPreferences("tapdrop", MODE_PRIVATE).edit().putString("ssid", ssid).putString("pass", pass).apply()
-        fun e(s: String) = s.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace(":", "\\:").replace("\"", "\\\"")
-        val text = if (pass.isEmpty()) "WIFI:T:nopass;S:${e(ssid)};;" else "WIFI:T:WPA;S:${e(ssid)};P:${e(pass)};;"
-        showQrDialog(text, "Join \"$ssid\"", "On the iPhone, open the Camera and point it at this code. It only needs to do this once.")
-    }
-
-    private fun openHotspotSettings() {
-        val tries = listOf(
-            // vivo: Settings → More connections → Personal hotspot
-            Intent().setComponent(ComponentName("com.android.settings", "com.android.settings.Settings\$VivoTetherSettingsActivity")),
-            Intent("com.android.settings.WIFI_TETHER_SETTINGS"),
-            Intent().setComponent(ComponentName("com.android.settings", "com.android.settings.TetherSettings")),
-            Intent("android.settings.TETHER_SETTINGS"),
-            Intent(Settings.ACTION_WIRELESS_SETTINGS),
-        )
-        for (t in tries) {
-            try { startActivity(t); return } catch (_: Exception) {}
+            ShareState.addListener(l)
+            d.setOnDismissListener { ShareState.removeListener(l) }
         }
     }
 
@@ -570,20 +988,25 @@ class MainActivity : Activity() {
     }
 
     private fun buildUi(): FrameLayout {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+        val root = FrameLayout(this).apply {
+            // pages lie over each other, so the incoming one shows at once while it slides in
             clipChildren = false
             clipToPadding = false
         }
+        // SolCube's sections: the bottom pill switches between Share and Settings
+        val sharePage = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; clipChildren = false; clipToPadding = false }
+        val setPage = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; clipChildren = false; clipToPadding = false }
+        root.addView(sharePage, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        root.addView(setPage, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
 
         // same title as SolCube: 42sp bold, pinned over the page (it floats up a little and the
         // page blurs under it as you scroll); see pinnedBackdropLayout
-        val title = label("SolDrop", 42f, p.fg).apply {
+        val title = label("AstraDrop", 42f, p.fg).apply {
             typeface = fontBold
             letterSpacing = -0.02f
         }
 
-        // ---- hero / status
+        // ---- status: what's going on, and the two ways the iPhone connects
         val hero = card().apply { clipChildren = false; clipToPadding = false }
         val heroRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
@@ -620,251 +1043,606 @@ class MainActivity : Activity() {
         heroRow.addView(heroText, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         hero.addView(heroRow)
 
-        primaryBtn = label("", 17f, p.onAccent, bold = true).apply {
-            gravity = Gravity.CENTER
-            setOnClickListener {
-                if (ShareState.running) stopServer() else {
-                    userStopped = false
-                    refreshNetworks()
-                    startServer()
-                }
-            }
+        // what's moving right now (only while something is)
+        transferBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; visibility = View.GONE }
+        transferText = label("", 13.5f, p.fg, bold = true).apply { maxLines = 1; ellipsize = TextUtils.TruncateAt.MIDDLE }
+        transferBox.addView(transferText)
+        transferBar = android.widget.ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 1000
+            progressTintList = ColorStateList.valueOf(p.link)
+            progressBackgroundTintList = ColorStateList.valueOf(alpha(p.fg, 0.15f))
         }
-        hero.addView(primaryBtn, LinearLayout.LayoutParams(MATCH_PARENT, 56.dp).apply { topMargin = 20.dp })
+        transferBox.addView(transferBar, LinearLayout.LayoutParams(MATCH_PARENT, 6.dp).apply { topMargin = 6.dp })
+        hero.addView(transferBox, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = 14.dp })
+        devBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; visibility = View.GONE }
+        hero.addView(devBox, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = 12.dp })
+
+        primaryBtn = ui.button("Start sharing", filled = true, size = 17f, radius = 28) { onPrimary() }
+        hero.addView(primaryBtn, LinearLayout.LayoutParams(MATCH_PARENT, 54.dp).apply { topMargin = 18.dp })
+
+        val ways = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; clipChildren = false; clipToPadding = false }
+        tapWay = WayTile(Glyph.TAP, "Tap") { onTap() }
+        scanWay = WayTile(Glyph.QR, "Scan") { onScan() }
+        tapWay.setOnLongClickListener { tapHelp(); true }
+        ways.addView(tapWay, LinearLayout.LayoutParams(0, MATCH_PARENT, 1f))
+        ways.addView(scanWay, LinearLayout.LayoutParams(0, MATCH_PARENT, 1f).apply { leftMargin = 10.dp })
+        hero.addView(ways, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = 18.dp })
 
         // small glass pills (SolCube style): readable over any part of the wallpaper, one line each
         val actions = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER
             clipChildren = false; clipToPadding = false
         }
-        nfcAction = smallPill("Turn on NFC") { startActivity(Intent(Settings.ACTION_NFC_SETTINGS)) }
-        actions.addView(nfcAction, rowPillParams(first = true))
-        actions.addView(smallPill("QR code") {
+        actions.addView(smallPill("Copy link") {
             val u = ShareState.url()
-            if (u == null) toast("Start sharing first")
-            else showQrDialog(u, "Link QR", "If the tap doesn't bring up a banner, scan this with the iPhone Camera instead.")
-        }, rowPillParams())
+            if (u == null) toast("Sharing hasn't started yet") else {
+                getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("AstraDrop link", u))
+                toast(t("Link copied. It opens once, on one phone."))
+            }
+        }, rowPillParams(first = true))
         actions.addView(smallPill("New link") {
-            ShareState.rotateToken()
-            toast("New link made. The old one no longer works.")
+            ui.dialog("Make a new link?", "Phones that have the current link can't open it anymore. Anyone who should still have access taps or scans again.",
+                positive = "New link", negative = "Cancel", onPositive = {
+                    ShareState.rotateToken()
+                    toast("New link made")
+                })
         }, rowPillParams())
-        for (i in 0 until actions.childCount) actions.getChildAt(i).setPadding(6.dp, 0, 6.dp, 0)
-        hero.addView(actions, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = 16.dp })
+        hero.addView(actions, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = 14.dp })
         // SolCube's first card sits 100dp lower than its title gap (its "Can't find a feature?" pill row)
-        root.addView(hero, cardParams().apply { topMargin = 100.dp })
+        sharePage.addView(hero, cardParams().apply { topMargin = 100.dp })
 
         // ---- network
         val net = card()
-        net.addView(sectionTitle("iPhone connects via"))
-        chipsRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            clipChildren = false; clipToPadding = false
-            setPadding(16.dp, 14.dp, 16.dp, 14.dp)   // room for the gold chip's halo (the scroller clips this row to its bounds)
-        }
-        // the row carries the halo room as padding; negative margins keep the chips where they were
-        net.addView(HorizontalScrollView(this).apply {
-            isHorizontalScrollBarEnabled = false
-            clipToPadding = false
-            addView(chipsRow)
-        }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply {
-            topMargin = 10.dp - 14.dp; bottomMargin = -14.dp; leftMargin = -16.dp; rightMargin = -16.dp
-        })
-        linkView = label("", 13f, p.sub).apply {
-            setPadding(2.dp, 12.dp, 0, 0)
-            setOnClickListener {
-                val u = ShareState.url() ?: return@setOnClickListener
-                getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("SolDrop link", u))
-                toast("Link copied")
-            }
-        }
-        net.addView(linkView)
-        root.addView(net, cardParams())
+        net.addView(sectionTitle("Both phones on one network"))
+        val tiles = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; clipChildren = false; clipToPadding = false }
+        wifiTile = WayTile(Glyph.WIFI, "Wi-Fi") { onWifiTile() }
+        hotTile = WayTile(Glyph.HOTSPOT, "Hotspot") { onHotspotTile() }
+        hotTile.setOnLongClickListener { onHotspotTile(forceCode = true); true }
+        tiles.addView(wifiTile, LinearLayout.LayoutParams(0, MATCH_PARENT, 1f))
+        tiles.addView(hotTile, LinearLayout.LayoutParams(0, MATCH_PARENT, 1f).apply { leftMargin = 10.dp })
+        net.addView(tiles, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = 14.dp })
+        netHint = label("", 14f, p.sub).apply { setPadding(2.dp, 12.dp, 0, 0); setLineSpacing(0f, 1.15f) }
+        net.addView(netHint)
+        sharePage.addView(net, cardParams())
 
-        // ---- sending
+        // ---- to the iPhone
         val send = card()
         val sendHead = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
             clipChildren = false; clipToPadding = false
         }
-        sendTitle = sectionTitle("Sending")
+        sendTitle = sectionTitle("To the iPhone")
         sendHead.addView(sendTitle, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        sendHead.addView(smallPill("+ Files") { pickFiles() }, pillParams())
-        clearBtn = smallPill("Clear") {
+        clearBtn = smallPill("Remove all") {
             ShareState.items.forEach { ThumbStore.forget(it.uri); RawConverter.forget(it); Compressor.forget(it) }
             ShareState.items.clear()
             clearCache()
+            ShareState.texts.clear()
             ShareState.notifyChanged()
         }
-        sendHead.addView(clearBtn, pillParams())
+        sendHead.addView(clearBtn, pillParams(first = true))
         send.addView(sendHead)
-        sendHint = label("Add photos here, or share them from Gallery with “Send to iPhone”. The iPhone can send you files even if this is empty.", 14f, p.sub).apply {
+        sendHint = label("Add photos or files, or share them from Gallery with “Send to iPhone”. On the iPhone, big photos can be shrunk to a smaller copy before saving (Compress). The iPhone can send you files even when this is empty.", 14f, p.sub).apply {
             setPadding(0, 8.dp, 0, 4.dp); setLineSpacing(0f, 1.15f)
         }
         send.addView(sendHint)
         sendGrid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         send.addView(sendGrid, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = 10.dp })
-        root.addView(send, cardParams())
+        sharePage.addView(send, cardParams())
 
-        // ---- received
+        // ---- from the iPhone
         val recv = card()
-        recvTitle = sectionTitle("Received")
-        recv.addView(recvTitle)
-        recvHint = label("Photos and videos from the iPhone show up here, and in your Gallery under SolDrop.", 14f, p.sub).apply {
+        recvTitle = sectionTitle("From the iPhone")
+        val recvHead = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            clipChildren = false; clipToPadding = false
+        }
+        recvHead.addView(recvTitle, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        historyAllBtn = smallPill("Show all") { showHistory() }.also { it.visibility = View.GONE }
+        recvHead.addView(historyAllBtn, pillParams(first = true))
+        historyClearBtn = smallPill("Clear") { askClearHistory() }.also { it.visibility = View.GONE }
+        recvHead.addView(historyClearBtn, pillParams())
+        recv.addView(recvHead)
+        recvHint = label("Photos, videos, files and texts the iPhone sends show up here (photos also in your Gallery under AstraDrop). Touch and hold one for more.", 14f, p.sub).apply {
             setPadding(0, 4.dp, 0, 0); setLineSpacing(0f, 1.15f)
         }
         recv.addView(recvHint)
         recvGrid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         recv.addView(recvGrid, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = 10.dp })
-        root.addView(recv, cardParams())
+        sharePage.addView(recv, cardParams())
 
-        // ---- hotspot (collapsible)
-        val hot = card()
-        hotCard = hot
-        val hotHead = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setOnClickListener {
-                val show = hotspotBody.visibility != View.VISIBLE
-                hotspotBody.visibility = if (show) View.VISIBLE else View.GONE
-                chevron.setOpen(show, animate = true)
-                if (show) {
-                    // once the opened card has been laid out, bring all of it into view
-                    hotCard.post {
-                        val target = hotCard.bottom + 16.dp - (scrollView.height - scrollView.paddingTop - scrollView.paddingBottom)
-                        if (target > scrollView.scrollY) scrollView.smoothScrollTo(0, target)
-                    }
-                }
-            }
-        }
-        hotHead.addView(sectionTitle("Not on the same Wi-Fi?"), LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        chevron = ChevronBadgeView(false).apply { setOnClickListener { hotHead.performClick() } }
-        hotHead.addView(chevron, LinearLayout.LayoutParams(30.dp, 30.dp).apply { leftMargin = 8.dp })
-        hot.addView(hotHead)
-        hotspotBody = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; visibility = View.GONE }
-        hotspotBody.addView(label("Turn on your hotspot. The first time, the iPhone joins by scanning a Wi-Fi QR code. After that it reconnects by itself, so it's just: hotspot on, tap.", 14f, p.sub).apply {
-            setPadding(0, 6.dp, 0, 12.dp); setLineSpacing(0f, 1.15f)
-        })
-        val prefs = getSharedPreferences("tapdrop", MODE_PRIVATE)
-        ssidEdit = field("Hotspot name").apply { setText(prefs.getString("ssid", "")) }
-        passEdit = field("Hotspot password").apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
-            setText(prefs.getString("pass", ""))
-        }
-        hotspotBody.addView(ssidEdit, LinearLayout.LayoutParams(MATCH_PARENT, 50.dp))
-        hotspotBody.addView(passEdit, LinearLayout.LayoutParams(MATCH_PARENT, 50.dp).apply { topMargin = 8.dp })
-        val hotBtns = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        hotBtns.addView(pillButton("Show Wi-Fi QR", filled = true) { showWifiQr() }, LinearLayout.LayoutParams(0, 48.dp, 1f))
-        hotBtns.addView(pillButton("Hotspot settings", filled = false) { openHotspotSettings() },
-            LinearLayout.LayoutParams(0, 48.dp, 1f).apply { leftMargin = 10.dp })
-        hotspotBody.addView(hotBtns, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = 14.dp })
-        hot.addView(hotspotBody)
-        root.addView(hot, cardParams())
-
-        // ---- NFC through Shizuku (optional, off by default)
+        // ---- Auto mode (optional extra, needs the one-time engine setup)
         val auto = card()
-        val autoHead = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        val autoText = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        autoText.addView(sectionTitle("Turn NFC on for me"))
-        autoText.addView(label("Through Shizuku: NFC turns on when sharing starts, and off when it stops or SolDrop is swiped away.", 14f, p.sub).apply {
-            setPadding(0, 4.dp, 0, 0); setLineSpacing(0f, 1.15f)
-        })
-        autoHead.addView(autoText, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        nfcToggle = label("", 15f, p.fg, bold = true).apply {
-            gravity = Gravity.CENTER
-            setOnClickListener { toggleShizukuNfc() }
+        val autoHead = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            clipChildren = false; clipToPadding = false
         }
-        autoHead.addView(nfcToggle, LinearLayout.LayoutParams(76.dp, 40.dp).apply { leftMargin = 12.dp })
+        val autoCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val titleRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        titleRow.addView(sectionTitle("Auto mode"))
+        titleRow.addView(label("EXTRA", 10.5f, p.link, bold = true).apply {
+            letterSpacing = 0.08f
+            setPadding(8.dp, 3.dp, 8.dp, 3.dp)
+            background = rounded(alpha(p.link, 0.14f), 10.dp)
+        }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { leftMargin = 8.dp })
+        autoCol.addView(titleRow)
+        autoText = label("", 14f, p.sub).apply { setPadding(0, 4.dp, 0, 0); setLineSpacing(0f, 1.15f) }
+        autoCol.addView(autoText)
+        autoHead.addView(autoCol, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        autoBtn = ui.button("", filled = true, size = 15f, radius = 20) { onAutoButton() }
+        autoHead.addView(autoBtn, LinearLayout.LayoutParams(WRAP_CONTENT, 40.dp).apply { leftMargin = 12.dp })
         auto.addView(autoHead)
-        nfcToggleNote = label("", 13.5f, p.warn).apply {
+        autoNote = label("", 13.5f, p.warn).apply {
             setPadding(0, 10.dp, 0, 0); setLineSpacing(0f, 1.15f)
-            setOnClickListener { fixShizuku() }
+            setOnClickListener { onAutoNote() }
         }
-        auto.addView(nfcToggleNote)
-        root.addView(auto, cardParams())
+        auto.addView(autoNote)
+        setPage.addView(auto, cardParams().apply { topMargin = 100.dp })
+
+        // ---- look & help
+        val look = card()
+        val themeHead = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        themeHead.addView(sectionTitle("Theme"), LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        val modeNames = arrayOf(t("Light"), t("Follows the system"), t("Dark"))
+        val themeVal = label(modeNames[Look.themeMode(this)], 13f, p.sub)
+        themeHead.addView(themeVal)
+        look.addView(themeHead)
+        look.addView(ThemeSlider(Look.themeMode(this)) { mode ->
+            themeVal.text = modeNames[mode]
+            if (mode != Look.themeMode(this)) {
+                val wasDark = isDark()
+                Look.setThemeMode(this, mode)
+                // let the thumb finish sliding, then rebuild the screen in the new colours
+                if (Look.isDark(this) != wasDark) main.postDelayed({ recreate() }, 260)
+            }
+        }, LinearLayout.LayoutParams(MATCH_PARENT, 44.dp).apply { topMargin = 12.dp })
+        val helpRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; clipChildren = false; clipToPadding = false }
+        helpRow.addView(smallPill("Replay the tour") { startActivity(Intent(this, TourActivity::class.java)) }, rowPillParams(first = true))
+        helpRow.addView(smallPill("Auto mode setup") { startActivity(Intent(this, SetupActivity::class.java)) }, rowPillParams())
+        look.addView(settingRow(t("App language"), { I18n.name(I18n.saved(this)) }) {
+            ui.choose(t("App language"), I18n.CHOICES.map { I18n.name(it) }, I18n.CHOICES.indexOf(I18n.saved(this))) { i ->
+                I18n.setApp(this, I18n.CHOICES[i]); recreate()
+            }
+        }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = 18.dp })
+        look.addView(settingRow(t("iPhone page language"), { I18n.webName(I18n.savedWeb(this)) }) {
+            val opts = I18n.WEB_CHOICES
+            ui.choose(t("iPhone page language"), opts.map { I18n.webName(it) }, opts.indexOf(I18n.savedWeb(this))) { i ->
+                I18n.setWeb(this, opts[i]); render()
+            }
+        }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = 10.dp })
+        look.addView(settingRow(t("Stop sharing when idle"), { idleName(Idle.minutes(this)) }) {
+            ui.choose(t("Stop sharing when idle"), Idle.CHOICES.map { idleName(it) }, Idle.CHOICES.indexOf(Idle.minutes(this))) { i ->
+                Idle.set(this, Idle.CHOICES[i]); render()
+            }
+        }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = 10.dp })
+        look.addView(label("After this long with nothing happening, sharing stops by itself (never while AstraDrop is on screen).", 12.5f, p.sub).apply {
+            setPadding(2.dp, 6.dp, 0, 0); setLineSpacing(0f, 1.12f)
+        })
+        fun onOff(v: Boolean) = if (v) t("On") else t("Off")
+        look.addView(settingRow(t("Stop when it has everything"), { onOff(DoneStop.on(this)) }) {
+            ui.choose(t("Stop when it has everything"), listOf(t("On"), t("Off")), if (DoneStop.on(this)) 0 else 1) { i ->
+                DoneStop.set(this, i == 0); render()
+            }
+        }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = 14.dp })
+        look.addView(label("Sharing stops by itself once the iPhone has every shared file.", 12.5f, p.sub).apply {
+            setPadding(2.dp, 6.dp, 0, 0); setLineSpacing(0f, 1.12f)
+        })
+        look.addView(settingRow(t("Ask before a device joins"), { onOff(Ask.on(this)) }) {
+            ui.choose(t("Ask before a device joins"), listOf(t("On"), t("Off")), if (Ask.on(this)) 0 else 1) { i ->
+                Ask.set(this, i == 0); render()
+            }
+        }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = 14.dp })
+        look.addView(label("Each tap or code works once, for one phone. With this on, you also allow each new phone here before it sees anything.", 12.5f, p.sub).apply {
+            setPadding(2.dp, 6.dp, 0, 0); setLineSpacing(0f, 1.12f)
+        })
+        look.addView(helpRow, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = 16.dp })
+        setPage.addView(look, cardParams())
 
         // on its own glass pill so it reads over the wallpaper
-        root.addView(FrameLayout(this).apply {
-            addView(label("Keep SolDrop open on screen while the iPhone taps.", 12.5f, p.sub).apply {
+        sharePage.addView(FrameLayout(this).apply {
+            addView(label("Keep AstraDrop open while the iPhone connects. Swipe it away to stop sharing.", 12.5f, p.sub).apply {
                 gravity = Gravity.CENTER
                 setPadding(16.dp, 8.dp, 16.dp, 8.dp)
                 background = glass(16.dp, level = 0)
             }, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.CENTER_HORIZONTAL))
         }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = 4.dp })
         val ver = try { packageManager.getPackageInfo(packageName, 0).versionName } catch (_: Exception) { "" }
-        root.addView(label("SolDrop $ver", 12f, p.sub).apply { gravity = Gravity.CENTER },
+        setPage.addView(label("AstraDrop $ver", 12f, p.sub).apply { gravity = Gravity.CENTER },
             LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = 12.dp })
 
+        // ---- sections: SolCube's bottom pill and its slide between pages
+        val pages = listOf(sharePage, setPage)
+        val tabs = listOf(
+            BottomTab("share", t("Share"), BottomNavPill.ICON_SHARE),
+            BottomTab("settings", t("Settings"), BottomNavPill.ICON_SETTINGS),
+        )
+        activeTab = getSharedPreferences("ui", MODE_PRIVATE).getInt("tab", 0).coerceIn(0, pages.lastIndex)
+        pages.forEachIndexed { i, v -> v.visibility = if (i == activeTab) View.VISIBLE else View.GONE }
+        val pill = BottomNavPill(this, p, fontMedium, isDark())
+        val pillLp = FrameLayout.LayoutParams(236.dp, 54.dp).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            bottomMargin = 14.dp
+        }
+        var tabAnim: ValueAnimator? = null
+        val tabInterp = android.view.animation.PathInterpolator(0.16f, 1f, 0.30f, 1f)
+        fun resetPage(v: View) { v.translationX = 0f; v.alpha = 1f; v.scaleX = 1f; v.scaleY = 1f }
+
+        fun selectTab(newIdx: Int, animate: Boolean = true) {
+            val target = newIdx.coerceIn(0, pages.lastIndex)
+            if (target == activeTab) return
+            val oldIdx = activeTab
+            pageScrollY[oldIdx] = scrollView.scrollY
+            activeTab = target
+            getSharedPreferences("ui", MODE_PRIVATE).edit().putInt("tab", target).apply()
+            tabAnim?.cancel()
+            tabAnim = null
+            pages.forEach { it.animate().cancel() }
+            val outPage = pages[oldIdx]
+            val inPage = pages[target]
+            inPage.visibility = View.VISIBLE
+            if (!animate || !ValueAnimator.areAnimatorsEnabled()) {
+                outPage.visibility = View.GONE
+                resetPage(outPage); resetPage(inPage)
+            } else {
+                // the old page slides out under the new one (both laid over each other meanwhile)
+                val dir = if (target > oldIdx) 1f else -1f
+                val travel = 48.dp.toFloat()
+                outPage.visibility = View.VISIBLE
+                var cancelled = false
+                tabAnim = ValueAnimator.ofFloat(0f, 1f).apply {
+                    duration = 440L
+                    interpolator = tabInterp
+                    addUpdateListener { a ->
+                        val f = a.animatedValue as Float
+                        inPage.translationX = dir * travel * (1f - f)
+                        inPage.alpha = f
+                        val inScale = 0.97f + 0.03f * f
+                        inPage.scaleX = inScale; inPage.scaleY = inScale
+                        val outF = (f * 1.15f).coerceIn(0f, 1f)
+                        outPage.translationX = -dir * travel * 0.7f * outF
+                        outPage.alpha = 1f - outF
+                        val outScale = 1f - 0.03f * outF
+                        outPage.scaleX = outScale; outPage.scaleY = outScale
+                        pill.invalidateBackdrop()
+                    }
+                    addListener(object : android.animation.AnimatorListenerAdapter() {
+                        override fun onAnimationCancel(animation: android.animation.Animator) { cancelled = true }
+                        override fun onAnimationEnd(animation: android.animation.Animator) {
+                            if (!cancelled) {
+                                outPage.visibility = View.GONE
+                                resetPage(outPage); resetPage(inPage)
+                                tabAnim = null
+                                pill.invalidateBackdrop()
+                            }
+                        }
+                    })
+                    start()
+                }
+            }
+            scrollView.post {
+                scrollView.scrollTo(0, pageScrollY[target])
+                pill.invalidateBackdrop()
+            }
+        }
+        pill.bind(tabs, activeTab) { idx -> selectTab(idx) }
+        showTab = { idx -> selectTab(idx); pill.select(idx) }
+
         // SolCube's numbers (its build(): title 22dp in, 28dp down, 22dp above the page)
-        return pinnedBackdropLayout(
+        val screen = pinnedBackdropLayout(
             titleView = title,
             body = root,
             titleLeftPx = 22.dp,
             titleTopPx = 28.dp,
             titleBottomGapPx = 22.dp,
             bodySidePadPx = 16.dp,
-            bodyBottomPadPx = 24.dp,
+            bodyBottomPadPx = 92.dp,
             blurBelowTitlePx = 12.dp,
             fadeBelowTitlePx = 0,
             liftPx = 18.dp,
             liftStartPx = 44.dp,
             liftSpanPx = 110.dp,
+            container = SwipeTabFrame(
+                canSwipeAt = { ev -> pill.height == 0 || ev.y < pill.top },
+                onSwipe = { delta ->
+                    val next = (activeTab + delta).coerceIn(0, pages.lastIndex)
+                    if (next != activeTab) { selectTab(next); pill.select(next) }
+                },
+            ),
+            onScrollChange = { pill.invalidateBackdrop() },
+            onLayersReady = { bd, sw ->
+                bd.register(pill)
+                pill.setBackdropSources { listOf(bd, sw) }
+            },
+            onBottomInset = { b ->
+                val want = b + 14.dp
+                if (pillLp.bottomMargin != want) { pillLp.bottomMargin = want; pill.layoutParams = pillLp }
+            },
         )
+        screen.addView(pill, pillLp)
+        return screen
     }
 
-    // ================================================================== NFC through Shizuku
+    /** SolCube's sideways swipe between sections (not over the bottom pill itself). */
+    private inner class SwipeTabFrame(
+        private val canSwipeAt: (android.view.MotionEvent) -> Boolean,
+        private val onSwipe: (delta: Int) -> Unit,
+    ) : FrameLayout(this) {
+        private var downX = 0f
+        private var downY = 0f
+        private var tracking = false
+        private val minSwipePx = 52.dp.toFloat()
 
-    private fun renderNfcToggle() {
-        if (!::nfcToggle.isInitialized) return
-        val on = NfcShizuku.enabled(this)
-        if (nfcToggle.tag != on) {
-            nfcToggle.tag = on
-            nfcToggle.text = if (on) "On" else "Off"
-            nfcToggle.setTextColor(if (on) p.onAccent else p.fg)
-            nfcToggle.background = if (on) accentGradient(20.dp) else glass(20.dp)
-            nfcToggle.foreground = ripple(null, 20.dp)
+        override fun onInterceptTouchEvent(ev: android.view.MotionEvent): Boolean {
+            when (ev.actionMasked) {
+                android.view.MotionEvent.ACTION_DOWN -> { tracking = canSwipeAt(ev); downX = ev.x; downY = ev.y }
+                android.view.MotionEvent.ACTION_MOVE -> if (tracking) {
+                    val dx = ev.x - downX
+                    val dy = ev.y - downY
+                    if (kotlin.math.abs(dx) > minSwipePx && kotlin.math.abs(dx) > kotlin.math.abs(dy) * 1.8f) return true
+                }
+                android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> tracking = false
+            }
+            return super.onInterceptTouchEvent(ev)
         }
-        val note = if (!on) "" else when (NfcShizuku.state(this)) {
-            NfcShizuku.State.READY -> if (Island.a11yEnabled(this) || NfcShizuku.solCubeInstalled(this)) "" else "Tap to switch on “SolDrop NFC pill” in Accessibility, so “NFC on” and “NFC off” show at the top of the screen."
-            NfcShizuku.State.NOT_INSTALLED -> "Shizuku isn't installed. Get it from Google Play, then start it."
-            NfcShizuku.State.NOT_RUNNING -> "Shizuku isn't running (it stops on every reboot). Tap to open it and start it."
-            NfcShizuku.State.NO_PERMISSION -> "Tap to allow SolDrop in Shizuku."
-        }
-        nfcToggleNote.text = note
-        nfcToggleNote.visibility = if (note.isEmpty()) View.GONE else View.VISIBLE
-    }
 
-    private fun toggleShizukuNfc() {
-        val on = !NfcShizuku.enabled(this)
-        NfcShizuku.setEnabled(this, on)
-        if (on) {
-            if (NfcShizuku.state(this) == NfcShizuku.State.READY) {
-                if (ShareState.running) NfcShizuku.set(this, true)
-            } else fixShizuku()
-        } else {
-            NfcShizuku.disarm(this)
-        }
-        renderNfcToggle()
-    }
-
-    private fun fixShizuku() {
-        when (NfcShizuku.state(this)) {
-            NfcShizuku.State.NO_PERMISSION -> try { Shizuku.requestPermission(1) } catch (_: Throwable) {}
-            NfcShizuku.State.NOT_RUNNING ->
-                packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")?.let { startActivity(it) }
-            NfcShizuku.State.NOT_INSTALLED -> try {
-                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=moe.shizuku.privileged.api")))
-            } catch (_: Exception) { toast("Shizuku isn't installed") }
-            NfcShizuku.State.READY -> if (!Island.a11yEnabled(this)) openA11ySettings()
+        override fun onTouchEvent(ev: android.view.MotionEvent): Boolean {
+            when (ev.actionMasked) {
+                android.view.MotionEvent.ACTION_UP -> if (tracking) {
+                    tracking = false
+                    val dx = ev.x - downX
+                    val dy = ev.y - downY
+                    if (kotlin.math.abs(dx) > minSwipePx && kotlin.math.abs(dx) > kotlin.math.abs(dy) * 1.5f) onSwipe(if (dx < 0f) 1 else -1)
+                    return true
+                }
+                android.view.MotionEvent.ACTION_CANCEL -> tracking = false
+            }
+            return super.onTouchEvent(ev)
         }
     }
 
-    /** Straight to SolDrop's page in Accessibility (vivo/Android won't let Shizuku switch a new app's service on). */
-    private fun openA11ySettings() {
-        val cn = ComponentName(this, SolDropA11y::class.java).flattenToString()
-        try {
-            startActivity(Intent("android.settings.ACCESSIBILITY_DETAILS_SETTINGS").putExtra(Intent.EXTRA_COMPONENT_NAME, cn))
-        } catch (_: Exception) {
-            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+    // ================================================================== way & network tiles
+
+    private enum class Glyph { TAP, QR, WIFI, HOTSPOT }
+
+    /** Small line icons drawn in code, in the tile's text colour. */
+    private inner class GlyphView(private val g: Glyph) : View(this) {
+        private val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            style = android.graphics.Paint.Style.STROKE
+            strokeCap = android.graphics.Paint.Cap.ROUND
+            strokeJoin = android.graphics.Paint.Join.ROUND
+            strokeWidth = 2.dp.toFloat()
+        }
+        private val r = android.graphics.RectF()
+        var color = p.fg
+            set(v) { field = v; invalidate() }
+
+        override fun onDraw(c: android.graphics.Canvas) {
+            val s = minOf(width, height).toFloat()
+            val cx = width / 2f
+            val cy = height / 2f
+            paint.color = color
+            paint.style = android.graphics.Paint.Style.STROKE
+            when (g) {
+                Glyph.TAP -> for (i in 0..2) {
+                    val rr = s * (0.16f + i * 0.15f)
+                    r.set(cx - s * 0.22f - rr, cy - rr, cx - s * 0.22f + rr, cy + rr)
+                    c.drawArc(r, -50f, 100f, false, paint)
+                }
+                Glyph.QR -> {
+                    // three finder squares with their centre dots, and a few data modules
+                    val u = s * 0.11f
+                    val o = s * 0.44f
+                    for ((x, y) in listOf(-1 to -1, 1 to -1, -1 to 1)) {
+                        val fx = cx + x * (o - u * 1.5f)
+                        val fy = cy + y * (o - u * 1.5f)
+                        paint.style = android.graphics.Paint.Style.STROKE
+                        r.set(fx - u * 1.5f, fy - u * 1.5f, fx + u * 1.5f, fy + u * 1.5f)
+                        c.drawRoundRect(r, u * 0.6f, u * 0.6f, paint)
+                        paint.style = android.graphics.Paint.Style.FILL
+                        c.drawRect(fx - u * 0.5f, fy - u * 0.5f, fx + u * 0.5f, fy + u * 0.5f, paint)
+                    }
+                    paint.style = android.graphics.Paint.Style.FILL
+                    for ((mx, my) in listOf(1 to 1, 3 to 1, 2 to 2, 1 to 3, 3 to 3)) {
+                        val x0 = cx + (mx - 1) * u * 1.1f
+                        val y0 = cy + (my - 1) * u * 1.1f
+                        c.drawRect(x0, y0, x0 + u * 0.9f, y0 + u * 0.9f, paint)
+                    }
+                }
+                Glyph.WIFI -> {
+                    for (i in 1..3) {
+                        val rr = s * 0.15f * i
+                        r.set(cx - rr, cy + s * 0.22f - rr, cx + rr, cy + s * 0.22f + rr)
+                        c.drawArc(r, 225f, 90f, false, paint)
+                    }
+                    paint.style = android.graphics.Paint.Style.FILL
+                    c.drawCircle(cx, cy + s * 0.22f, 2.dp.toFloat(), paint)
+                }
+                Glyph.HOTSPOT -> {
+                    for (i in 1..2) {
+                        val rr = s * 0.17f * i
+                        r.set(cx - rr, cy - rr, cx + rr, cy + rr)
+                        c.drawArc(r, 205f, 130f, false, paint)
+                        c.drawArc(r, 25f, 130f, false, paint)
+                    }
+                    paint.style = android.graphics.Paint.Style.FILL
+                    c.drawCircle(cx, cy, 2.5f * resources.displayMetrics.density, paint)
+                }
+            }
+        }
+    }
+
+    /**
+     * A glass tile with an icon, a name and one line of state. Never hidden: greyed out when it
+     * can't work right now (still tappable: it then says or opens what's missing); a gold rim
+     * when it's the one in use.
+     */
+    private inner class WayTile(g: Glyph, name: String, onClick: () -> Unit) : LinearLayout(this) {
+        private val glyph = GlyphView(g)
+        private val line = label("", 12.5f, p.sub).apply { maxLines = 2; setLineSpacing(0f, 1.1f) }
+        private var key = ""
+
+        init {
+            orientation = VERTICAL
+            setPadding(14.dp, 12.dp, 12.dp, 12.dp)
+            clipChildren = false
+            clipToPadding = false
+            addView(glyph, LayoutParams(26.dp, 26.dp))
+            addView(label(name, 15.5f, p.fg, bold = true), LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = 6.dp })
+            addView(line, LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = 1.dp })
+            foreground = ripple(null, 18.dp)
+            setOnClickListener { onClick() }
+            set("", active = false, warn = false, dim = false)
+        }
+
+        fun set(text: String, active: Boolean, warn: Boolean, dim: Boolean) {
+            if (line.text.toString() != text) line.text = text
+            line.setTextColor(if (warn) p.warn else p.sub)
+            glyph.color = if (active) p.link else p.fg
+            alpha = if (dim) 0.5f else 1f
+            val k = "$active"
+            if (k != key) {
+                key = k
+                // new glass only when the rim changes (each pane compiles a shader)
+                background = if (active) ui.glass(18.dp, ui.alpha(p.link, if (isDark()) 0.10f else 0.08f), level = 1, stroke = ui.alpha(p.link, 0.7f))
+                    else ui.glass(18.dp, level = 1, stroke = p.btnStroke)
+            }
+        }
+    }
+
+    // ================================================================== theme switch (SolCube's)
+
+    /** Light / System / Dark: a sliding gold thumb you can tap or drag. */
+    private inner class ThemeSlider(initial: Int, private val onPick: (Int) -> Unit) : View(this) {
+        private val labels = arrayOf(t("Light"), t("System"), t("Dark"))
+        private val dd = resources.displayMetrics.density
+        private var mode = initial.coerceIn(0, 2)
+        private var pos = mode.toFloat()
+        private var anim: ValueAnimator? = null
+        private val thumb = android.graphics.RectF()
+        private val thumbPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            color = p.fill
+            if (p.halo != 0) setShadowLayer(8f * dd, 0f, 0f, p.halo)
+            else setShadowLayer(4f * dd, 0f, 1.5f * dd, alpha(Color.BLACK, 0.18f))
+        }
+        private val rimPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            style = android.graphics.Paint.Style.STROKE
+            strokeWidth = 1.2f * dd
+            color = if (p.fillStroke != 0) p.fillStroke else alpha(Color.WHITE, 0.45f)
+        }
+        private val textPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            textAlign = android.graphics.Paint.Align.CENTER
+            textSize = 13.5f * dd
+            typeface = fontMedium
+        }
+        private var downX = 0f
+        private var dragging = false
+        private val slop = android.view.ViewConfiguration.get(context).scaledTouchSlop
+
+        init {
+            background = ui.glass(22.dp, level = 1, stroke = p.btnStroke)
+        }
+
+        override fun onDraw(c: android.graphics.Canvas) {
+            super.onDraw(c)
+            val pad = 4f * dd
+            val seg = ((width - 2 * pad) / 3f).coerceAtLeast(1f)
+            val th = (height - 2 * pad).coerceAtLeast(1f)
+            thumb.set(pad + pos * seg, pad, pad + pos * seg + seg, pad + th)
+            c.drawRoundRect(thumb, th / 2, th / 2, thumbPaint)
+            val i = rimPaint.strokeWidth / 2
+            thumb.inset(i, i)
+            c.drawRoundRect(thumb, th / 2 - i, th / 2 - i, rimPaint)
+            val fm = textPaint.fontMetrics
+            val base = height / 2f - (fm.ascent + fm.descent) / 2
+            for (k in labels.indices) {
+                val w = (1f - kotlin.math.abs(pos - k)).coerceIn(0f, 1f)
+                textPaint.color = mix(p.sub, p.onAccent, w)
+                c.drawText(labels[k], pad + (k + 0.5f) * seg, base, textPaint)
+            }
+        }
+
+        private fun mix(a: Int, b: Int, t: Float) = Color.argb(
+            (Color.alpha(a) + (Color.alpha(b) - Color.alpha(a)) * t).toInt(),
+            (Color.red(a) + (Color.red(b) - Color.red(a)) * t).toInt(),
+            (Color.green(a) + (Color.green(b) - Color.green(a)) * t).toInt(),
+            (Color.blue(a) + (Color.blue(b) - Color.blue(a)) * t).toInt(),
+        )
+
+        @android.annotation.SuppressLint("ClickableViewAccessibility")
+        override fun onTouchEvent(e: android.view.MotionEvent): Boolean {
+            val pad = 4f * dd
+            val seg = ((width - 2 * pad) / 3f).coerceAtLeast(1f)
+            when (e.actionMasked) {
+                android.view.MotionEvent.ACTION_DOWN -> { downX = e.x; dragging = false; anim?.cancel(); parent?.requestDisallowInterceptTouchEvent(true) }
+                android.view.MotionEvent.ACTION_MOVE -> {
+                    if (!dragging && kotlin.math.abs(e.x - downX) > slop) dragging = true
+                    if (dragging) { pos = ((e.x - pad) / seg - 0.5f).coerceIn(0f, 2f); invalidate() }
+                }
+                android.view.MotionEvent.ACTION_UP -> {
+                    val target = if (dragging) kotlin.math.round(pos).toInt() else ((e.x - pad) / seg).toInt().coerceIn(0, 2)
+                    pick(target)
+                }
+                android.view.MotionEvent.ACTION_CANCEL -> pick(mode)
+            }
+            return true
+        }
+
+        private fun pick(m: Int) {
+            anim?.cancel()
+            anim = ValueAnimator.ofFloat(pos, m.toFloat()).apply {
+                duration = 240
+                interpolator = android.view.animation.PathInterpolator(0.2f, 0f, 0f, 1f)
+                addUpdateListener { pos = it.animatedValue as Float; invalidate() }
+                start()
+            }
+            if (m != mode) {
+                mode = m
+                performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
+            }
+            onPick(m)
+        }
+    }
+
+    // ================================================================== Auto mode
+
+    private fun renderAuto() {
+        if (!::autoBtn.isInitialized) return
+        val setUp = AutoNfc.setUp(this)
+        val on = setUp && AutoNfc.enabled(this)
+        autoText.text = if (setUp) t("NFC turns on when you open AstraDrop and off when you close it. Tap Hotspot to turn on your hotspot.")
+            else t("NFC turns on when you open AstraDrop and off when you close it, and Hotspot turns on your hotspot. One-time setup, about 2 minutes.")
+        val key = if (!setUp) "setup" else if (on) "on" else "off"
+        if (autoBtn.tag != key) {
+            autoBtn.tag = key
+            autoBtn.text = when (key) { "setup" -> t("Set up"); "on" -> t("On"); else -> t("Off") }
+            ui.setFilled(autoBtn, key != "off", radius = 20)
+        }
+        val note = if (!on) "" else when (AutoNfc.lastStart) {
+            Engine.Start.NO_WIFI -> "Starts the next time this phone is on Wi-Fi (Android only allows it there). Until then, tap Tap to turn on NFC yourself."
+            Engine.Start.NOT_PAIRED -> "The pairing was removed. Tap to set it up again."
+            Engine.Start.DEV_OFF -> "Developer options were turned off. Tap to set it up again."
+            Engine.Start.WD_OFF, Engine.Start.FAILED -> "Couldn't start. Tap to try again."
+            else -> if (Island.a11yEnabled(this) || AutoNfc.solCubeInstalled(this)) ""
+                else "Optional: tap to allow the “NFC on / off” pill at the top of the screen (Accessibility)."
+        }
+        autoNote.text = t(note)
+        autoNote.setTextColor(if (note.startsWith("Optional")) p.sub else p.warn)
+        autoNote.visibility = if (note.isEmpty()) View.GONE else View.VISIBLE
+    }
+
+    private fun onAutoButton() {
+        if (!AutoNfc.setUp(this)) { startActivity(Intent(this, SetupActivity::class.java)); return }
+        AutoNfc.setEnabled(this, !AutoNfc.enabled(this))
+        renderAuto()
+        render()
+    }
+
+    private fun onAutoNote() {
+        when (AutoNfc.lastStart) {
+            Engine.Start.NOT_PAIRED, Engine.Start.DEV_OFF -> startActivity(Intent(this, SetupActivity::class.java))
+            Engine.Start.WD_OFF, Engine.Start.FAILED -> { AutoNfc.ensureEngine(this); toast("Starting…") }
+            Engine.Start.NO_WIFI -> {}
+            else -> Nav.accessibility(this)
         }
     }
 
@@ -876,7 +1654,7 @@ class MainActivity : Activity() {
      */
     private fun pinnedBackdropLayout(
         titleView: TextView,
-        body: LinearLayout,
+        body: android.view.ViewGroup,
         titleLeftPx: Int,
         titleTopPx: Int,
         titleBottomGapPx: Int,
@@ -887,6 +1665,10 @@ class MainActivity : Activity() {
         liftPx: Int,
         liftStartPx: Int,
         liftSpanPx: Int,
+        container: FrameLayout = FrameLayout(this),
+        onScrollChange: () -> Unit = {},
+        onLayersReady: (GlassBackdrop, View) -> Unit = { _, _ -> },
+        onBottomInset: (Int) -> Unit = {},
     ): FrameLayout {
         titleView.measure(
             View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
@@ -981,6 +1763,7 @@ class MainActivity : Activity() {
         }
         scroll.setOnScrollChangeListener { _, _, y, _, _ ->
             bd.setScroll(y, scroll)
+            onScrollChange()
             val want = if (y > 0) headerBlur else null
             if (appliedBlur !== want) {
                 appliedBlur = want
@@ -999,7 +1782,8 @@ class MainActivity : Activity() {
             }
         }
 
-        return FrameLayout(this).apply {
+        onLayersReady(bd, scrollWrap)
+        return container.apply {
             addView(bd, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             addView(scrollWrap, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
             addView(titleView, titleLp)
@@ -1012,6 +1796,7 @@ class MainActivity : Activity() {
                     topInset = t
                     bottomInset = b
                     syncLayout()
+                    onBottomInset(b)
                 }
                 insets
             }
@@ -1119,7 +1904,7 @@ class MainActivity : Activity() {
         return tile
     }
 
-    private fun addTile(): View {
+    private fun addTile(what: String, onClick: () -> Unit): View {
         val tile = SquareFrame(this).apply {
             background = GradientDrawable().apply {
                 cornerRadius = 14.dp.toFloat()
@@ -1127,11 +1912,11 @@ class MainActivity : Activity() {
                 setColor(p.tile)
             }
             foreground = ripple(null, 14.dp)
-            setOnClickListener { pickMedia() }
+            setOnClickListener { onClick() }
         }
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER }
         col.addView(label("+", 30f, p.link).apply { gravity = Gravity.CENTER })
-        col.addView(label("Photos", 13f, p.link, bold = true).apply { gravity = Gravity.CENTER })
+        col.addView(label(what, 13f, p.link, bold = true).apply { gravity = Gravity.CENTER })
         tile.addView(col, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
         return tile
     }
@@ -1159,8 +1944,26 @@ class MainActivity : Activity() {
 
     private fun sectionTitle(t: String) = label(t, 17f, p.fg, bold = true)
 
+    private val settingRefresh = mutableListOf<() -> Unit>()
+
+    /** A settings line: name on the left, current value in a glass pill on the right. */
+    private fun settingRow(name: String, value: () -> String, onClick: () -> Unit): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            clipChildren = false; clipToPadding = false
+        }
+        row.addView(label(name, 15f, p.fg, bold = true).apply { setLineSpacing(0f, 1.1f) }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        val v = smallPill(value()) { onClick() }
+        row.addView(v, LinearLayout.LayoutParams(WRAP_CONTENT, 34.dp).apply { leftMargin = 10.dp })
+        settingRefresh += { val s = value(); if (v.text.toString() != s) v.text = s }
+        return row
+    }
+
+    private fun idleName(m: Int) = if (m == 0) t("Never") else if (m < 60) t("After %d min").format(m) else t("After 1 hour")
+
+    /** A text in the app's language (English text is the key, see I18n). */
     private fun label(t: String, size: Float, color: Int, bold: Boolean = false) = TextView(this).apply {
-        text = t
+        text = I18n.t(t)
         textSize = size
         setTextColor(color)
         typeface = if (bold) fontMedium else fontRegular
@@ -1243,25 +2046,8 @@ class MainActivity : Activity() {
         setOnClickListener { onClick() }
     }
 
-    private fun pillButton(t: String, filled: Boolean, onClick: () -> Unit) =
-        label(t, 15f, if (filled) p.onAccent else p.link, bold = true).apply {
-            gravity = Gravity.CENTER
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
-            // ripple as an overlay: wrapped around the background it would clip the gold halo to a box
-            background = if (filled) accentGradient(24.dp) else glass(24.dp)
-            foreground = ripple(null, 24.dp)
-            setOnClickListener { onClick() }
-        }
-
-    private fun chip(t: String, selected: Boolean, warn: Boolean = false, onClick: () -> Unit) =
-        label(t, 14f, if (selected) p.onAccent else if (warn) p.warn else p.fg, bold = selected).apply {
-            setPadding(14.dp, 9.dp, 14.dp, 9.dp)
-            background = if (selected) accentGradient(20.dp) else glass(20.dp)
-            foreground = ripple(null, 20.dp)
-            setOnClickListener { onClick() }
-            layoutParams = LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { rightMargin = 8.dp }
-        }
+    /** SolCube's pill button (see Ui.button): gold when [filled], else outlined. */
+    private fun pillButton(t: String, filled: Boolean, onClick: () -> Unit) = ui.button(t, filled, onClick = onClick)
 
     private fun field(hint: String) = EditText(this).apply {
         this.hint = hint
@@ -1299,71 +2085,22 @@ class MainActivity : Activity() {
         return if (s >= 3600) "%d:%02d:%02d".format(s / 3600, (s % 3600) / 60, s % 60) else "%d:%02d".format(s / 60, s % 60)
     }
 
-    private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_SHORT).show()
+    private fun toast(t: String) = Toast.makeText(this, I18n.t(t), Toast.LENGTH_SHORT).show()
 
     private val Int.dp: Int get() = (this * resources.displayMetrics.density).toInt()
 
     // ================================================================== theme
 
-    private fun isDark() =
-        (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+    private fun isDark() = Look.isDark(this)
 
-    private fun white(a: Float) = Color.argb((a * 255).toInt(), 255, 255, 255)
-
-    // "Sol" palette, shared with SolCube: night = the icon's black with its amber-gold glow on
-    // buttons and links; day = porcelain with ink buttons and amber links.
-    private fun palette() = if (isDark()) Palette(
-        base = Color.rgb(0x04, 0x03, 0x02),
-        glows = listOf(Color.rgb(0x1E, 0x12, 0x05), Color.rgb(0x12, 0x0C, 0x06), Color.rgb(0x1A, 0x10, 0x04), Color.rgb(0x0E, 0x0B, 0x08)),
-        solid = Color.rgb(0x11, 0x0E, 0x0A),
-        glass = white(0.055f), sheen = white(0.04f), stroke = white(0.10f),
-        tile = white(0.06f), chip = white(0.05f), field = white(0.07f),
-        fg = Color.rgb(0xF5, 0xF1, 0xEA), sub = Color.rgb(0xBC, 0xB3, 0xA6),
-        accent = Color.rgb(0xFF, 0xDF, 0x9E), accent2 = Color.rgb(0xE0, 0x8C, 0x24),
-        warn = Color.rgb(0xFF, 0x86, 0x5E), danger = Color.rgb(0xFF, 0x5F, 0x57),
-        link = Color.rgb(0xFF, 0xB6, 0x45), onAccent = Color.rgb(0x1E, 0x10, 0x02),
-        fillStroke = Color.argb(210, 0xFF, 0xE4, 0x9A), halo = Color.argb(185, 0xFF, 0x9E, 0x1A),
-        fill = Color.argb(250, 0xF4, 0xB2, 0x4C), fillShine = 1.1f,
-    ) else Palette(
-        base = Color.rgb(0xF6, 0xF2, 0xEC),
-        glows = listOf(Color.rgb(0xEE, 0xD6, 0xAE), Color.rgb(0xE6, 0xDC, 0xCC), Color.rgb(0xF2, 0xD9, 0xB4), Color.rgb(0xE2, 0xDA, 0xD0)),
-        solid = Color.rgb(0xFB, 0xF8, 0xF3),
-        glass = white(0.58f), sheen = white(0.5f), stroke = white(0.9f),
-        tile = white(0.55f), chip = white(0.45f), field = white(0.65f),
-        fg = Color.rgb(0x18, 0x17, 0x1C), sub = Color.rgb(0x5F, 0x5A, 0x55),
-        accent = Color.rgb(0x2A, 0x25, 0x20), accent2 = Color.rgb(0x12, 0x0F, 0x0C),
-        warn = Color.rgb(0xB8, 0x3E, 0x1C), danger = Color.rgb(0xC6, 0x2A, 0x22),
-        link = Color.rgb(0xA8, 0x62, 0x10), onAccent = Color.rgb(0xFF, 0xE2, 0xA8),
-        fill = Color.argb(242, 0x1E, 0x1A, 0x16), fillShine = 0.37f,
-    )
-
-    @Suppress("DEPRECATION")
-    private fun styleSystemBars() {
-        window.statusBarColor = Color.TRANSPARENT
-        window.navigationBarColor = Color.TRANSPARENT
-        window.isNavigationBarContrastEnforced = false
-        window.decorView.setBackgroundColor(p.base)
-        if (Build.VERSION.SDK_INT >= 30) {
-            window.setDecorFitsSystemWindows(false)
-        } else {
-            window.decorView.systemUiVisibility = window.decorView.systemUiVisibility or
-                View.SYSTEM_UI_FLAG_LAYOUT_STABLE or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
-                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-        }
-        if (!isDark()) {
-            if (Build.VERSION.SDK_INT >= 30) {
-                val f = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
-                window.insetsController?.setSystemBarsAppearance(f, f)
-            } else {
-                window.decorView.systemUiVisibility = window.decorView.systemUiVisibility or
-                    View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
-            }
-        }
-    }
+    private fun styleSystemBars() = ui.styleBars(this)
 
     companion object {
+        private const val RECV_SHOWN = 9
         private const val REQ_MEDIA = 1
         private const val REQ_FILES = 2
+        private const val REQ_NEARBY = 11
+        const val ACTION_QUICK = "dev.tapdrop.QUICK"
         private const val HEADER_BLUR_MASK_SRC = """
 uniform shader src;
 uniform float yTop;

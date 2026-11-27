@@ -125,6 +125,7 @@ object RawConverter {
                     progress[item.id] = y.toFloat() / h
                 }
             }
+            ExifCopy.copy(ctx, item.uri, out, orientation = false)
             Log.i("TapDrop", "raw: ${item.name} -> ${out.length()} bytes in ${SystemClock.elapsedRealtime() - t0} ms")
             SharedItem(item.id, Uri.fromFile(out), name, "image/jpeg", out.length(), orig = item.uri, origMime = item.mime)
         } catch (t: Throwable) {

@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -7,22 +8,27 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.NFC" />
     <uses-permission android:name="android.permission.VIBRATE" />
-    <!-- the "NFC on / off" pill (SolCube's), granted through Shizuku -->
+    <!-- the "NFC on / off" pill (SolCube's) when the accessibility service is off -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- "AstraDrop network" (local-only hotspot); never used for location -->
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" android:usesPermissionFlags="neverForLocation" />
+    <!-- granted by AstraDrop's engine: keeps its Wireless debugging pairing alive -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" tools:ignore="ProtectedPermissions" />
 
     <uses-feature android:name="android.hardware.nfc.hce" android:required="false" />
 
-    <!-- Shizuku (installed?) and SolCube (draws the NFC pill when SolDrop's own service is off) -->
+    <!-- SolCube draws the NFC pill when AstraDrop's own accessibility service is off -->
     <queries>
-        <package android:name="moe.shizuku.privileged.api" />
         <package android:name="dev.suite" />
     </queries>
 
     <application
+        android:name=".App"
         android:label="@string/app_name"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
@@ -52,6 +58,20 @@
         </activity>
 
         <service
+            android:name=".QuickTile"
+            android:exported="true"
+            android:icon="@drawable/ic_stat"
+            android:label="AstraDrop"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <activity android:name=".TourActivity" android:exported="false" />
+        <activity android:name=".SetupActivity" android:exported="false" android:launchMode="singleTop" />
+
+        <service
             android:name=".ServerService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
@@ -79,12 +99,19 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/a11y" />
         </service>
-        <provider
-            android:name="rikka.shizuku.ShizukuProvider"
-            android:authorities="${applicationId}.shizuku"
-            android:enabled="true"
-            android:exported="true"
-            android:multiprocess="false"
-            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+        <service
+            android:name=".engine.PairingService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Wireless debugging pairing code" />
+        </service>
+        <receiver
+            android:name=".ActionReceiver"
+            android:exported="false" />
+        <receiver
+            android:name=".engine.PairingReplyReceiver"
+            android:exported="false" />
     </application>
 </manifest>

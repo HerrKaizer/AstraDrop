@@ -28,7 +28,7 @@ import kotlin.concurrent.thread
  * copies: the deeper the pane, the more it blurs.
  */
 class GlassBackdrop(context: Context) : View(context) {
-    private val dark = (context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+    private val dark = Look.isDark(context)
     private val density = resources.displayMetrics.density
     private val shader = RuntimeShader(SRC)
     private val paint = Paint()
@@ -187,20 +187,37 @@ class GlassBackdrop(context: Context) : View(context) {
             s.setFloatUniform("wDens", 1f)
         }
 
+        /** Called from App.onCreate: the wallpaper for the current theme starts decoding right away. */
+        fun preload(ctx: Context) {
+            val dark = Look.isDark(ctx)
+            main.post { load(ctx.applicationContext, dark) {} }
+        }
+
         private fun load(ctx: Context, dark: Boolean, done: (Wall) -> Unit) {
             cache[dark]?.let { return }
             waiting.getOrPut(dark) { mutableListOf() }.add(done)
             if (!loading.add(dark)) return
             val dm = ctx.resources.displayMetrics
             val screenDp = minOf(dm.widthPixels, dm.heightPixels) / dm.density
-            thread(name = "tapdrop-wallpaper", priority = Thread.NORM_PRIORITY - 1) {
+            thread(name = "tapdrop-wallpaper") {
                 val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
                 val full = BitmapFactory.decodeResource(ctx.resources, if (dark) R.drawable.wall_dark else R.drawable.wall_light, opts)
                 val sw = full.width / SMALL
                 val sh = full.height / SMALL
                 val base = Bitmap.createScaledBitmap(full, sw, sh, true)
                 val pxPerDp = sw / screenDp
-                val small = LEVEL_BLUR.map { blur -> blurred(base, (blur / 2f * 0.85f * pxPerDp).toInt().coerceAtLeast(1)) }
+                // the blurred copies are made once per wallpaper/screen size and kept on disk
+                val radii = LEVEL_BLUR.map { blur -> (blur / 2f * 0.85f * pxPerDp).toInt().coerceAtLeast(1) }
+                val stamp = runCatching { ctx.packageManager.getPackageInfo(ctx.packageName, 0).lastUpdateTime }.getOrDefault(0L)
+                val dir = java.io.File(ctx.cacheDir.parentFile, "wall").apply { mkdirs() }
+                val small = radii.mapIndexed { i, r ->
+                    val f = java.io.File(dir, "${if (dark) "d" else "l"}_${sw}x${sh}_r${r}_$stamp.png")
+                    f.takeIf { it.exists() }?.let { runCatching { BitmapFactory.decodeFile(it.path, opts) }.getOrNull() }
+                        ?: blurred(base, r).also { b ->
+                            if (i == 0) dir.listFiles()?.forEach { o -> if (!o.name.endsWith("_$stamp.png")) o.delete() }
+                            runCatching { java.io.FileOutputStream(f).use { b.compress(Bitmap.CompressFormat.PNG, 100, it) } }
+                        }
+                }
                 full.prepareToDraw()
                 val w = Wall(full, small)
                 main.post {

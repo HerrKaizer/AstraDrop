@@ -13,8 +13,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 
-/** A ready-made thumbnail: JPEG bytes plus video length (or -1). */
-class Thumb(val jpeg: ByteArray, val durationMs: Long)
+/** A ready-made thumbnail: WebP bytes plus video length (or -1). */
+class Thumb(val bytes: ByteArray, val durationMs: Long, val mime: String = "image/webp")
 
 /**
  * One thumbnail per file, shared by the app's grid and the web page. Thumbnails
@@ -22,7 +22,7 @@ class Thumb(val jpeg: ByteArray, val durationMs: Long)
  * iPhone opens the page they're already waiting in memory.
  */
 object ThumbStore {
-    private const val PX = 480
+    private const val PX = 384
     private val pool = Executors.newFixedThreadPool(2)
     private val jobs = ConcurrentHashMap<String, Future<Thumb?>>()
 
@@ -74,7 +74,7 @@ object ThumbStore {
         }
         val b = bmp ?: return null
         val bos = ByteArrayOutputStream()
-        b.compress(Bitmap.CompressFormat.JPEG, 80, bos)
+        b.compress(Bitmap.CompressFormat.WEBP_LOSSY, 74, bos)
         return Thumb(bos.toByteArray(), dur)
     }
 }

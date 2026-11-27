@@ -34,10 +34,10 @@ import kotlin.math.sin
  * a small dark pill in the status bar between the clock and the punch hole. It comes out of the
  * hole like a water drop: a blob leaves the hole, stays joined to it by a thinning neck (metaball)
  * until it snaps free, then stretches into the pill and the text fades in. Closing runs the same
- * in reverse. SolDrop says "NFC on" / "NFC off" with it when it switches NFC through Shizuku.
+ * in reverse. AstraDrop says "NFC on" / "NFC off" with it when Automatic NFC switches NFC.
  *
- * SolDrop has no accessibility service, so this is always SolCube's fallback: an app overlay
- * (SolDrop grants itself the permission through Shizuku). Android 12+ draws a pass-through
+ * AstraDrop has no accessibility service, so this is always SolCube's fallback: an app overlay
+ * (allowed in Settings). Android 12+ draws a pass-through
  * (NOT_TOUCHABLE) app overlay at most 80 % opaque, which made the pill see-through, so the window
  * takes touches instead and is only as wide as the pill's area.
  */
@@ -63,8 +63,34 @@ object Island {
     /** How long a pill is out, from show() until it is back in the hole (spring 1.5 s + 3.5 s + 0.55 s). */
     const val SHOWN_MS = 5600L
 
+    private var fitted: Boolean? = null
+
+    /**
+     * Fits [geo] to this phone's camera hole (the defaults are the vivo X300 Ultra's, which the
+     * user tuned by eye; other sizes are scaled from them). False when there is no centred punch
+     * hole at the top (notch, corner hole, none): then no pill is shown.
+     */
+    private fun fit(ctx: Context): Boolean {
+        fitted?.let { return it }
+        val ok = runCatching {
+            val d = ctx.getSystemService(android.hardware.display.DisplayManager::class.java)
+                .getDisplay(android.view.Display.DEFAULT_DISPLAY)
+            val r = d.cutout?.boundingRectTop ?: return@runCatching false
+            val w = ctx.resources.displayMetrics.widthPixels.toFloat()
+            if (r.isEmpty || kotlin.math.abs(r.exactCenterX() - w / 2f) > w * 0.04f || r.width() > w * 0.15f) return@runCatching false
+            val hr = r.width() / 2f
+            val s = hr / 42f
+            geo = Geo(holeX = r.exactCenterX(), holeY = r.bottom - hr, holeR = hr, gap = 21f * s,
+                pillY = r.bottom - hr, pillH = 99f * s, leftLimit = 190f * w / 1440f)
+            true
+        }.getOrDefault(false)
+        fitted = ok
+        return ok
+    }
+
     fun show(ctx: Context, text: String, ok: Boolean = true, still: Boolean = false, waited: Int = 0) {
         if (Looper.myLooper() != Looper.getMainLooper()) { main.post { show(ctx, text, ok, still, waited) }; return }
+        if (!fit(ctx.applicationContext)) return
         current?.let {
             if (it.isAttachedToWindow) {
                 // going back in: let it finish, then come out fresh (starting mid-way looked broken)
@@ -108,7 +134,7 @@ object Island {
             alpha = 1f
             layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
             setFitInsetsTypes(0)
-            title = "SolDropIsland"
+            title = "AstraDropIsland"
         }
         try { wm.addView(view, lp); current = view } catch (e: Exception) { Log.w(TAG, "island", e) }
     }

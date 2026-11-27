@@ -33,7 +33,7 @@ class Thumbs(context: Context) {
         target.setImageDrawable(null)
         pool.execute {
             val t = ThumbStore.get(ctx, uri, mime)
-            val bmp = t?.let { BitmapFactory.decodeByteArray(it.jpeg, 0, it.jpeg.size) }
+            val bmp = t?.let { BitmapFactory.decodeByteArray(it.bytes, 0, it.bytes.size) }
             main.post {
                 if (bmp != null) cache.put(key, bmp)
                 val dur = t?.durationMs ?: -1L
